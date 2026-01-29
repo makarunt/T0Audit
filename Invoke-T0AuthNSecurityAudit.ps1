@@ -46,6 +46,15 @@
     When used with -UseAuthNPolicyAssignment, also includes pattern-based detection.
     Useful for finding T0 assets that should have policies but don't yet.
 
+.PARAMETER IncludeGapAnalysis
+    IMPORTANT: Run T0 Coverage Gap Analysis to identify privileged accounts (Domain Admins,
+    Enterprise Admins, Schema Admins, etc.) that are NOT protected by Authentication Policy
+    or Silo. These unprotected accounts can authenticate from any device, creating a security gap.
+
+.PARAMETER AdditionalPrivilegedGroups
+    Additional privileged groups to include in gap analysis. Array of group names or DNs.
+    Example: @("SQL Admins", "Exchange Admins", "CN=CustomAdmins,OU=Groups,DC=domain,DC=com")
+
 .EXAMPLE
     .\Invoke-T0AuthNSecurityAudit.ps1
     Basic usage - audits all AuthN Policies, Silos, DCs, and T0 accounts matching default patterns.
@@ -69,6 +78,18 @@
 .EXAMPLE
     .\Invoke-T0AuthNSecurityAudit.ps1 -T0SearchBase "OU=Tier0,DC=contoso,DC=com"
     Limit T0 account search to a specific OU.
+
+.EXAMPLE
+    .\Invoke-T0AuthNSecurityAudit.ps1 -IncludeGapAnalysis
+    Run gap analysis to find privileged accounts NOT protected by AuthN Policy/Silo.
+
+.EXAMPLE
+    .\Invoke-T0AuthNSecurityAudit.ps1 -UseAuthNPolicyAssignment -IncludeGapAnalysis
+    RECOMMENDED: Full audit using policy-based T0 detection plus gap analysis.
+
+.EXAMPLE
+    .\Invoke-T0AuthNSecurityAudit.ps1 -IncludeGapAnalysis -AdditionalPrivilegedGroups @("SQL Admins", "Exchange Organization Administrators")
+    Gap analysis including custom privileged groups specific to your environment.
 
 .NOTES
     Author: T0 Security Team
@@ -123,7 +144,13 @@ param(
     [switch]$UseAuthNPolicyAssignment = $false,
 
     [Parameter(HelpMessage = "Also include pattern matching when using -UseAuthNPolicyAssignment")]
-    [switch]$IncludePatternMatching = $false
+    [switch]$IncludePatternMatching = $false,
+
+    [Parameter(HelpMessage = "Run T0 Coverage Gap Analysis - find privileged accounts NOT protected by AuthN Policy/Silo")]
+    [switch]$IncludeGapAnalysis = $false,
+
+    [Parameter(HelpMessage = "Additional privileged groups to check in gap analysis (array of group names or DNs)")]
+    [string[]]$AdditionalPrivilegedGroups = @()
 )
 
 #region Configuration
@@ -838,6 +865,249 @@ function Get-T0PolicyAssignmentACLs {
     return $Results
 }
 
+function Get-T0CoverageGapAnalysis {
+    <#
+    .SYNOPSIS
+        Analyze privileged accounts that are NOT protected by Authentication Policy/Silo
+    #>
+
+    Write-Host "`n[*] Running T0 Coverage Gap Analysis..." -ForegroundColor Cyan
+    Write-Host "    Checking if privileged accounts are protected by AuthN Policy/Silo" -ForegroundColor Gray
+
+    $Results = [System.Collections.ArrayList]::new()
+
+    # Define privileged groups to check
+    $PrivilegedGroups = @(
+        @{ Name = "Domain Admins"; Criticality = "Critical"; Description = "Full domain control" }
+        @{ Name = "Enterprise Admins"; Criticality = "Critical"; Description = "Forest-wide admin rights" }
+        @{ Name = "Schema Admins"; Criticality = "Critical"; Description = "Can modify AD schema" }
+        @{ Name = "Administrators"; Criticality = "Critical"; Description = "Built-in administrators" }
+        @{ Name = "Account Operators"; Criticality = "High"; Description = "Can manage most accounts" }
+        @{ Name = "Backup Operators"; Criticality = "High"; Description = "Can backup/restore files, potential DCSync" }
+        @{ Name = "Server Operators"; Criticality = "High"; Description = "Can manage domain controllers" }
+        @{ Name = "Print Operators"; Criticality = "Medium"; Description = "Can load drivers on DCs" }
+        @{ Name = "DnsAdmins"; Criticality = "High"; Description = "Can load DLLs on DNS server (often DC)" }
+        @{ Name = "Group Policy Creator Owners"; Criticality = "High"; Description = "Can create GPOs" }
+    )
+
+    # Add any additional groups specified by user
+    foreach ($additionalGroup in $AdditionalPrivilegedGroups) {
+        $PrivilegedGroups += @{ Name = $additionalGroup; Criticality = "High"; Description = "User-specified privileged group" }
+    }
+
+    # Collect all privileged accounts
+    $PrivilegedAccounts = [System.Collections.ArrayList]::new()
+    $ProcessedDNs = @{}  # Track already processed accounts to avoid duplicates
+
+    foreach ($group in $PrivilegedGroups) {
+        Write-Host "  [+] Checking members of: $($group.Name)" -ForegroundColor Gray
+
+        try {
+            # Try to get group members (handle both name and DN formats)
+            $members = $null
+            try {
+                $members = Get-ADGroupMember -Identity $group.Name -Recursive -ErrorAction Stop
+            }
+            catch {
+                # Group might not exist in this domain (e.g., Enterprise Admins in child domain)
+                Write-Host "      Group not found or not accessible: $($group.Name)" -ForegroundColor Yellow
+                continue
+            }
+
+            foreach ($member in $members) {
+                # Skip if already processed
+                if ($ProcessedDNs.ContainsKey($member.distinguishedName)) {
+                    # Update group membership info
+                    $existingIdx = $PrivilegedAccounts.DN.IndexOf($member.distinguishedName)
+                    if ($existingIdx -ge 0) {
+                        $PrivilegedAccounts[$existingIdx].MemberOf += ", $($group.Name)"
+                    }
+                    continue
+                }
+
+                $ProcessedDNs[$member.distinguishedName] = $true
+
+                # Get full object details with AuthN Policy/Silo attributes
+                try {
+                    $adObject = Get-ADObject -Identity $member.distinguishedName `
+                        -Properties Name, DistinguishedName, objectClass, SamAccountName, Enabled, `
+                                    "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo", AdminCount `
+                        -ErrorAction Stop
+
+                    $null = $PrivilegedAccounts.Add([PSCustomObject]@{
+                        Name = $adObject.Name
+                        SamAccountName = $adObject.SamAccountName
+                        DN = $adObject.DistinguishedName
+                        ObjectClass = $adObject.objectClass
+                        MemberOf = $group.Name
+                        Criticality = $group.Criticality
+                        AuthNPolicy = $adObject."msDS-AssignedAuthNPolicy"
+                        AuthNPolicySilo = $adObject."msDS-AssignedAuthNPolicySilo"
+                        AdminCount = $adObject.AdminCount
+                    })
+                }
+                catch {
+                    # Object might be from another domain or deleted
+                }
+            }
+        }
+        catch {
+            Write-Host "      [!] Error processing group $($group.Name): $_" -ForegroundColor Red
+        }
+    }
+
+    # Also check AdminCount=1 accounts (AdminSDHolder protected)
+    Write-Host "  [+] Checking AdminSDHolder protected accounts (AdminCount=1)..." -ForegroundColor Gray
+    try {
+        $adminSDHolderAccounts = Get-ADUser -Filter { AdminCount -eq 1 } `
+            -Properties Name, DistinguishedName, SamAccountName, Enabled, `
+                        "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo", AdminCount `
+            -ErrorAction SilentlyContinue
+
+        foreach ($account in $adminSDHolderAccounts) {
+            if (-not $ProcessedDNs.ContainsKey($account.DistinguishedName)) {
+                $ProcessedDNs[$account.DistinguishedName] = $true
+                $null = $PrivilegedAccounts.Add([PSCustomObject]@{
+                    Name = $account.Name
+                    SamAccountName = $account.SamAccountName
+                    DN = $account.DistinguishedName
+                    ObjectClass = "user"
+                    MemberOf = "AdminSDHolder Protected"
+                    Criticality = "High"
+                    AuthNPolicy = $account."msDS-AssignedAuthNPolicy"
+                    AuthNPolicySilo = $account."msDS-AssignedAuthNPolicySilo"
+                    AdminCount = $account.AdminCount
+                })
+            }
+        }
+    }
+    catch {
+        Write-Host "      [!] Error querying AdminSDHolder accounts: $_" -ForegroundColor Red
+    }
+
+    # Check Domain Controllers
+    Write-Host "  [+] Checking Domain Controllers..." -ForegroundColor Gray
+    try {
+        $domainControllers = Get-ADComputer -Filter { PrimaryGroupID -eq 516 -or PrimaryGroupID -eq 521 } `
+            -Properties Name, DistinguishedName, "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo" `
+            -ErrorAction SilentlyContinue
+
+        foreach ($dc in $domainControllers) {
+            if (-not $ProcessedDNs.ContainsKey($dc.DistinguishedName)) {
+                $ProcessedDNs[$dc.DistinguishedName] = $true
+                $null = $PrivilegedAccounts.Add([PSCustomObject]@{
+                    Name = $dc.Name
+                    SamAccountName = $dc.Name + "$"
+                    DN = $dc.DistinguishedName
+                    ObjectClass = "computer"
+                    MemberOf = "Domain Controllers"
+                    Criticality = "Critical"
+                    AuthNPolicy = $dc."msDS-AssignedAuthNPolicy"
+                    AuthNPolicySilo = $dc."msDS-AssignedAuthNPolicySilo"
+                    AdminCount = $null
+                })
+            }
+        }
+    }
+    catch {
+        Write-Host "      [!] Error querying Domain Controllers: $_" -ForegroundColor Red
+    }
+
+    Write-Host "  [+] Found $($PrivilegedAccounts.Count) privileged accounts/computers to analyze" -ForegroundColor Green
+
+    # Check Silo membership lists (some accounts might be in silo but not have attribute set)
+    $SiloMembers = @{}
+    try {
+        $ConfigNC = (Get-ADRootDSE).configurationNamingContext
+        $SiloContainer = "CN=AuthN Policy Configuration,CN=Services,$ConfigNC"
+        $Silos = Get-ADObject -SearchBase $SiloContainer -Filter { objectClass -eq "msDS-AuthNPolicySilo" } `
+            -Properties Name, "msDS-AuthNPolicySiloMembers" -ErrorAction SilentlyContinue
+
+        foreach ($Silo in $Silos) {
+            $members = $Silo."msDS-AuthNPolicySiloMembers"
+            if ($members) {
+                foreach ($memberDN in $members) {
+                    $SiloMembers[$memberDN] = $Silo.Name
+                }
+            }
+        }
+    }
+    catch {
+        # Silently continue
+    }
+
+    # Analyze each privileged account
+    foreach ($account in $PrivilegedAccounts) {
+        $hasPolicy = -not [string]::IsNullOrEmpty($account.AuthNPolicy)
+        $hasSilo = -not [string]::IsNullOrEmpty($account.AuthNPolicySilo)
+        $inSiloMemberList = $SiloMembers.ContainsKey($account.DN)
+
+        $isProtected = $hasPolicy -or $hasSilo -or $inSiloMemberList
+        $protectionStatus = if ($isProtected) { "Protected" } else { "UNPROTECTED" }
+
+        $protectionDetails = @()
+        if ($hasPolicy) {
+            # Extract policy name from DN
+            $policyName = ($account.AuthNPolicy -split ",")[0] -replace "CN=", ""
+            $protectionDetails += "Policy: $policyName"
+        }
+        if ($hasSilo) {
+            $siloName = ($account.AuthNPolicySilo -split ",")[0] -replace "CN=", ""
+            $protectionDetails += "Silo: $siloName"
+        }
+        if ($inSiloMemberList -and -not $hasSilo) {
+            $protectionDetails += "Silo Member: $($SiloMembers[$account.DN])"
+        }
+        if (-not $isProtected) {
+            $protectionDetails += "No AuthN Policy or Silo assigned!"
+        }
+
+        $severity = if (-not $isProtected) {
+            if ($account.Criticality -eq "Critical") { "Critical" }
+            elseif ($account.Criticality -eq "High") { "High" }
+            else { "Medium" }
+        } else {
+            "Info"
+        }
+
+        $null = $Results.Add([PSCustomObject]@{
+            AccountName = $account.Name
+            SamAccountName = $account.SamAccountName
+            ObjectType = $account.ObjectClass
+            PrivilegedGroup = $account.MemberOf
+            GroupCriticality = $account.Criticality
+            ProtectionStatus = $protectionStatus
+            ProtectionDetails = ($protectionDetails -join "; ")
+            HasAuthNPolicy = $hasPolicy
+            HasAuthNPolicySilo = $hasSilo
+            IsInSiloMemberList = $inSiloMemberList
+            Severity = $severity
+            DistinguishedName = $account.DN
+        })
+    }
+
+    # Summary
+    $unprotectedCritical = ($Results | Where-Object { $_.Severity -eq "Critical" }).Count
+    $unprotectedHigh = ($Results | Where-Object { $_.Severity -eq "High" }).Count
+    $unprotectedMedium = ($Results | Where-Object { $_.Severity -eq "Medium" }).Count
+    $protected = ($Results | Where-Object { $_.ProtectionStatus -eq "Protected" }).Count
+
+    Write-Host ""
+    Write-Host "  Gap Analysis Summary:" -ForegroundColor Cyan
+    Write-Host "    Protected accounts:   $protected" -ForegroundColor Green
+    if ($unprotectedCritical -gt 0) {
+        Write-Host "    UNPROTECTED Critical: $unprotectedCritical" -ForegroundColor Red
+    }
+    if ($unprotectedHigh -gt 0) {
+        Write-Host "    UNPROTECTED High:     $unprotectedHigh" -ForegroundColor DarkYellow
+    }
+    if ($unprotectedMedium -gt 0) {
+        Write-Host "    UNPROTECTED Medium:   $unprotectedMedium" -ForegroundColor Yellow
+    }
+
+    return $Results
+}
+
 #endregion
 
 #region Report Generation Functions
@@ -873,18 +1143,37 @@ function Export-ToHTML {
         [Parameter(Mandatory)]
         [System.Collections.ArrayList]$AllResults,
         [Parameter(Mandatory)]
-        [string]$FileName
+        [string]$FileName,
+        [Parameter()]
+        [System.Collections.ArrayList]$GapAnalysisResults = $null
     )
 
     $FilePath = Join-Path $OutputPath $FileName
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
-    # Count findings by severity
+    # Count findings by severity (ACL findings)
     $CriticalCount = ($AllResults | Where-Object { $_.Severity -eq "Critical" }).Count
     $HighCount = ($AllResults | Where-Object { $_.Severity -eq "High" }).Count
     $MediumCount = ($AllResults | Where-Object { $_.Severity -eq "Medium" }).Count
     $LowCount = ($AllResults | Where-Object { $_.Severity -eq "Low" }).Count
     $InfoCount = ($AllResults | Where-Object { $_.Severity -eq "Info" }).Count
+
+    # Count gap analysis findings
+    $GapCriticalCount = 0
+    $GapHighCount = 0
+    $GapMediumCount = 0
+    $GapProtectedCount = 0
+    if ($GapAnalysisResults -and $GapAnalysisResults.Count -gt 0) {
+        $GapCriticalCount = ($GapAnalysisResults | Where-Object { $_.Severity -eq "Critical" }).Count
+        $GapHighCount = ($GapAnalysisResults | Where-Object { $_.Severity -eq "High" }).Count
+        $GapMediumCount = ($GapAnalysisResults | Where-Object { $_.Severity -eq "Medium" }).Count
+        $GapProtectedCount = ($GapAnalysisResults | Where-Object { $_.ProtectionStatus -eq "Protected" }).Count
+
+        # Add gap findings to total counts
+        $CriticalCount += $GapCriticalCount
+        $HighCount += $GapHighCount
+        $MediumCount += $GapMediumCount
+    }
 
     # Generate HTML
     $HTML = @"
@@ -1290,6 +1579,7 @@ function Export-ToHTML {
                 <option value="AuthN Policy">AuthN Policy</option>
                 <option value="AuthN Silo">AuthN Silo</option>
                 <option value="T0 Policy Assignment">T0 Policy Assignment</option>
+                <option value="Gap Analysis">Gap Analysis</option>
             </select>
             <label>Search:</label>
             <input type="text" id="searchFilter" onkeyup="filterTable()" placeholder="Search identities, objects...">
@@ -1464,10 +1754,113 @@ function Export-ToHTML {
         $HTML += '<div class="no-findings"><div class="icon">✓</div>No T0 accounts found matching the specified patterns or no relevant ACLs detected.</div>'
     }
 
-    $HTML += @"
-            </div>
-        </div>
+    $HTML += "</div></div>"
 
+    # Gap Analysis section (if available)
+    if ($GapAnalysisResults -and $GapAnalysisResults.Count -gt 0) {
+        $UnprotectedResults = $GapAnalysisResults | Where-Object { $_.ProtectionStatus -eq "UNPROTECTED" }
+        $ProtectedResults = $GapAnalysisResults | Where-Object { $_.ProtectionStatus -eq "Protected" }
+
+        $HTML += @"
+        <div class="section" style="border-left: 4px solid var(--critical-color);">
+            <div class="section-header" style="background: linear-gradient(135deg, #f8d7da 0%, #fff 100%);">
+                <h2>T0 Coverage Gap Analysis - Unprotected Privileged Accounts</h2>
+                <span class="badge" style="background: var(--critical-color);">$($UnprotectedResults.Count) UNPROTECTED</span>
+            </div>
+            <div class="table-container">
+"@
+
+        if ($UnprotectedResults.Count -gt 0) {
+            $HTML += @"
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Severity</th>
+                            <th>Account Name</th>
+                            <th>SAM Account</th>
+                            <th>Type</th>
+                            <th>Privileged Group(s)</th>
+                            <th>Protection Status</th>
+                            <th>Details</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+"@
+            foreach ($gap in ($UnprotectedResults | Sort-Object @{Expression={
+                switch ($_.Severity) { "Critical" { 0 } "High" { 1 } "Medium" { 2 } default { 3 } }
+            }})) {
+                $rowClass = switch ($gap.Severity) {
+                    "Critical" { "row-critical" }
+                    "High" { "row-high" }
+                    default { "" }
+                }
+                $severityClass = "severity-$($gap.Severity.ToLower())"
+
+                $HTML += @"
+                    <tr class="$rowClass" data-severity="$($gap.Severity.ToLower())" data-type="Gap Analysis">
+                        <td><span class="severity-badge $severityClass">$($gap.Severity)</span></td>
+                        <td><strong>$($gap.AccountName)</strong></td>
+                        <td>$($gap.SamAccountName)</td>
+                        <td>$($gap.ObjectType)</td>
+                        <td>$($gap.PrivilegedGroup)</td>
+                        <td><span class="severity-badge severity-critical">$($gap.ProtectionStatus)</span></td>
+                        <td>$($gap.ProtectionDetails)</td>
+                    </tr>
+"@
+            }
+            $HTML += "</tbody></table>"
+        } else {
+            $HTML += '<div class="no-findings" style="background: #d4edda;"><div class="icon">✓</div>All privileged accounts are protected by Authentication Policy or Silo!</div>'
+        }
+
+        $HTML += "</div></div>"
+
+        # Protected accounts section (collapsible/summary)
+        $HTML += @"
+        <div class="section">
+            <div class="section-header">
+                <h2>Protected Privileged Accounts</h2>
+                <span class="badge" style="background: #28a745;">$($ProtectedResults.Count) Protected</span>
+            </div>
+            <div class="table-container">
+"@
+
+        if ($ProtectedResults.Count -gt 0) {
+            $HTML += @"
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Status</th>
+                            <th>Account Name</th>
+                            <th>SAM Account</th>
+                            <th>Type</th>
+                            <th>Privileged Group(s)</th>
+                            <th>Protection Details</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+"@
+            foreach ($gap in $ProtectedResults) {
+                $HTML += @"
+                    <tr data-severity="info" data-type="Gap Analysis">
+                        <td><span class="severity-badge severity-info">Protected</span></td>
+                        <td>$($gap.AccountName)</td>
+                        <td>$($gap.SamAccountName)</td>
+                        <td>$($gap.ObjectType)</td>
+                        <td>$($gap.PrivilegedGroup)</td>
+                        <td>$($gap.ProtectionDetails)</td>
+                    </tr>
+"@
+            }
+            $HTML += "</tbody></table>"
+        } else {
+            $HTML += '<div class="no-findings"><div class="icon">!</div>No privileged accounts are currently protected.</div>'
+        }
+
+        $HTML += "</div></div>"
+    }
+
+    $HTML += @"
         <script>
             function filterTable() {
                 const severityFilter = document.getElementById('severityFilter').value;
@@ -1526,14 +1919,20 @@ try {
     $T0ACLs = Get-T0PolicyAssignmentACLs
     foreach ($item in $T0ACLs) { $null = $AllResults.Add($item) }
 
+    # Run Gap Analysis if requested
+    $GapAnalysisResults = $null
+    if ($IncludeGapAnalysis) {
+        $GapAnalysisResults = Get-T0CoverageGapAnalysis
+    }
+
     # Export results
     Write-Host "`n[*] Exporting results..." -ForegroundColor Cyan
 
-    if ($AllResults.Count -gt 0) {
+    if ($AllResults.Count -gt 0 -or ($GapAnalysisResults -and $GapAnalysisResults.Count -gt 0)) {
         # Export all results combined
         Export-ToCSV -Results $AllResults -FileName "T0_AuthN_Security_Audit_All.csv"
         Export-ToText -Results $AllResults -FileName "T0_AuthN_Security_Audit_All.txt"
-        Export-ToHTML -AllResults $AllResults -FileName "T0_AuthN_Security_Audit_Report.html"
+        Export-ToHTML -AllResults $AllResults -FileName "T0_AuthN_Security_Audit_Report.html" -GapAnalysisResults $GapAnalysisResults
 
         # Export individual reports
         if ($PolicyACLs.Count -gt 0) {
@@ -1544,6 +1943,9 @@ try {
         }
         if ($T0ACLs.Count -gt 0) {
             Export-ToCSV -Results ([System.Collections.ArrayList]$T0ACLs) -FileName "T0_PolicyAssignment_ACLs.csv"
+        }
+        if ($GapAnalysisResults -and $GapAnalysisResults.Count -gt 0) {
+            Export-ToCSV -Results ([System.Collections.ArrayList]$GapAnalysisResults) -FileName "T0_Coverage_Gap_Analysis.csv"
         }
 
         # Summary
@@ -1558,19 +1960,41 @@ try {
         $LowCount = ($AllResults | Where-Object { $_.Severity -eq "Low" }).Count
 
         Write-Host ""
-        Write-Host "  Total Findings: $($AllResults.Count)" -ForegroundColor White
+        Write-Host "  ACL Audit Findings: $($AllResults.Count)" -ForegroundColor White
         if ($CriticalCount -gt 0) {
-            Write-Host "  Critical: $CriticalCount" -ForegroundColor Red
+            Write-Host "    Critical: $CriticalCount" -ForegroundColor Red
         } else {
-            Write-Host "  Critical: 0" -ForegroundColor Green
+            Write-Host "    Critical: 0" -ForegroundColor Green
         }
         if ($HighCount -gt 0) {
-            Write-Host "  High: $HighCount" -ForegroundColor DarkYellow
+            Write-Host "    High: $HighCount" -ForegroundColor DarkYellow
         } else {
-            Write-Host "  High: 0" -ForegroundColor Green
+            Write-Host "    High: 0" -ForegroundColor Green
         }
-        Write-Host "  Medium: $MediumCount" -ForegroundColor Yellow
-        Write-Host "  Low: $LowCount" -ForegroundColor Gray
+        Write-Host "    Medium: $MediumCount" -ForegroundColor Yellow
+        Write-Host "    Low: $LowCount" -ForegroundColor Gray
+
+        # Gap Analysis Summary
+        if ($GapAnalysisResults -and $GapAnalysisResults.Count -gt 0) {
+            $GapCritical = ($GapAnalysisResults | Where-Object { $_.Severity -eq "Critical" }).Count
+            $GapHigh = ($GapAnalysisResults | Where-Object { $_.Severity -eq "High" }).Count
+            $GapMedium = ($GapAnalysisResults | Where-Object { $_.Severity -eq "Medium" }).Count
+            $GapProtected = ($GapAnalysisResults | Where-Object { $_.ProtectionStatus -eq "Protected" }).Count
+
+            Write-Host ""
+            Write-Host "  Gap Analysis (Privileged Accounts):" -ForegroundColor White
+            Write-Host "    Protected: $GapProtected" -ForegroundColor Green
+            if ($GapCritical -gt 0) {
+                Write-Host "    UNPROTECTED Critical: $GapCritical" -ForegroundColor Red
+            }
+            if ($GapHigh -gt 0) {
+                Write-Host "    UNPROTECTED High: $GapHigh" -ForegroundColor DarkYellow
+            }
+            if ($GapMedium -gt 0) {
+                Write-Host "    UNPROTECTED Medium: $GapMedium" -ForegroundColor Yellow
+            }
+        }
+
         Write-Host ""
         Write-Host "  Reports saved to: $OutputPath" -ForegroundColor Green
         Write-Host ""
