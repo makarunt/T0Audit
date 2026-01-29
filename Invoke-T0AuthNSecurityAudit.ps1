@@ -438,12 +438,47 @@ function Invoke-Phase1Discovery {
                 AssignedUsers = $discoveredSilos[$siloDN]
                 DiscoverySource = "Privileged User Assignment"
             })
+
+            # IMPORTANT: Also discover policies linked to this Silo
+            # These are T0 policies even if not directly assigned to users
+            $siloPolicies = @($silo."msDS-UserAuthNPolicy", $silo."msDS-ComputerAuthNPolicy", $silo."msDS-ServiceAuthNPolicy") |
+                            Where-Object { -not [string]::IsNullOrEmpty($_) }
+
+            foreach ($policyDN in $siloPolicies) {
+                # Check if we already have this policy
+                $existingPolicy = $Script:T0Policies | Where-Object { $_.DN -eq $policyDN }
+                if (-not $existingPolicy) {
+                    try {
+                        $policy = Get-ADObject -Identity $policyDN `
+                            -Properties Name, DistinguishedName, Description, `
+                                        "msDS-UserAllowedToAuthenticateFrom", "msDS-UserAllowedToAuthenticateTo", `
+                                        "msDS-UserTGTLifetime", "msDS-ComputerAllowedToAuthenticateTo", `
+                                        "msDS-ServiceAllowedToAuthenticateFrom", "msDS-ServiceAllowedToAuthenticateTo"
+
+                        $null = $Script:T0Policies.Add([PSCustomObject]@{
+                            Name = $policy.Name
+                            DN = $policy.DistinguishedName
+                            Description = $policy.Description
+                            UserAllowedToAuthenticateFrom = $policy."msDS-UserAllowedToAuthenticateFrom"
+                            UserAllowedToAuthenticateTo = $policy."msDS-UserAllowedToAuthenticateTo"
+                            UserTGTLifetime = $policy."msDS-UserTGTLifetime"
+                            AssignedUsers = @()
+                            DiscoverySource = "Linked to Silo: $($silo.Name)"
+                        })
+                        Write-Host "      Discovered policy from silo: $($policy.Name)" -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Host "      [!] Could not read policy linked to silo: $policyDN" -ForegroundColor Yellow
+                    }
+                }
+            }
         }
         catch {
             Write-Host "      [!] Could not read silo: $siloDN" -ForegroundColor Yellow
         }
     }
     Write-Host "    Found $($Script:T0Silos.Count) T0 Authentication Silos" -ForegroundColor Green
+    Write-Host "    Found $($Script:T0Policies.Count) T0 Authentication Policies (including silo-linked)" -ForegroundColor Green
 
     # Step 1.4: Extract Infrastructure Groups from Policies
     Write-Host "[Phase 1.4] Extracting T0 Infrastructure Groups from Policies..." -ForegroundColor Cyan
@@ -974,7 +1009,7 @@ function Export-HTMLReport {
         .discovery-summary h3 { color: #0066cc; margin-bottom: 10px; }
         .discovery-summary ul { list-style: none; }
         .discovery-summary li { padding: 5px 0; }
-        .discovery-summary li::before { content: "✓ "; color: #28a745; font-weight: bold; }
+        .discovery-summary li::before { content: "[OK] "; color: #28a745; font-weight: bold; }
 
         .note { background: #fff3cd; border-left: 4px solid #ffc107; padding: 10px 15px; margin: 15px 0; border-radius: 0 5px 5px 0; font-size: 0.9em; }
         .note.info { background: var(--info-bg); border-color: var(--info-color); }
@@ -1162,7 +1197,7 @@ function Export-HTMLReport {
         $HTML += "</tbody></table>"
     }
     else {
-        $HTML += '<div class="no-findings"><div class="icon">✓</div>All privileged accounts and Domain Controllers are properly protected!</div>'
+        $HTML += '<div class="no-findings"><div class="icon">[OK]</div>All privileged accounts and Domain Controllers are properly protected!</div>'
     }
 
     # Show protected accounts count
@@ -1209,7 +1244,7 @@ function Export-HTMLReport {
                             <td><strong>$($comp.ComputerName)</strong></td>
                             <td>$($comp.DNSHostName)</td>
                             <td>$($comp.OperatingSystem)</td>
-                            <td>$(if ($comp.IsDomainController) { '✓ Yes' } else { 'No' })</td>
+                            <td>$(if ($comp.IsDomainController) { 'Yes' } else { 'No' })</td>
                             <td>$($comp.SourceGroup)</td>
                         </tr>
 "@
@@ -1217,7 +1252,7 @@ function Export-HTMLReport {
         $HTML += "</tbody></table>"
     }
     else {
-        $HTML += '<div class="no-findings"><div class="icon">⚠</div>No T0 Infrastructure Groups found. Unable to map T0 admin reachability.</div>'
+        $HTML += '<div class="no-findings"><div class="icon">[!]</div>No T0 Infrastructure Groups found. Unable to map T0 admin reachability.</div>'
     }
 
     $HTML += @"
