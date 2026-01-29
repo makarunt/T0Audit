@@ -1,187 +1,98 @@
+[CmdletBinding()]
+param(
+    [Parameter(HelpMessage = "Path where audit results will be saved")]
+    [string]$OutputPath = "C:\T0_Audit",
+
+    [Parameter(HelpMessage = "Include inherited permissions in ACL audit")]
+    [switch]$IncludeInherited = $false,
+
+    [Parameter(HelpMessage = "Additional privileged groups to include (array of group names)")]
+    [string[]]$AdditionalPrivilegedGroups = @()
+)
+
 <#
 .SYNOPSIS
     T0 Authentication Security Infrastructure Audit Script
 
 .DESCRIPTION
-    This script audits the security of Tier 0 authentication infrastructure in Active Directory:
-    - ACLs on Authentication Policy objects
-    - ACLs on Authentication Silo objects
-    - Rights on msDS-AssignedAuthNPolicy attribute on T0 accounts
+    This script performs a comprehensive audit of Tier 0 authentication security:
 
-    Outputs results in CSV, TXT, and HTML formats with color-coded severity ratings.
+    Phase 1: Identity & Perimeter Discovery
+    - Identifies high-privilege users (DA, EA, SA members)
+    - Locates their assigned Authentication Policies and Silos
+    - Maps the infrastructure groups (allowed sign-on targets)
+
+    Phase 2: Security Object ACL Audit
+    - Audits ACLs on discovered T0 Policies and Silos
+    - Uses contextual severity classification (SYSTEM on DC = Info, not Critical)
+
+    Phase 3: Gap Analysis
+    - Checks if all privileged accounts have policy assignments
+    - Verifies DCs are in the T0 infrastructure group
+
+    Phase 4: Access Map (Reachability Report)
+    - Lists all computers where T0 admins can sign on
+    - Flags non-DCs in T0 groups as potential "T0 Pollution"
+
+    Phase 5: Report Generation
+    - ACL Trust Report (unauthorized managers only)
+    - Identity & Infrastructure Gaps
+    - Effective Perimeter Map
 
 .PARAMETER OutputPath
     Path where audit results will be saved. Default: C:\T0_Audit
 
-.PARAMETER T0UserFilter
-    Filter for identifying T0 user accounts. Default: {Name -like "*-T0" -or Name -like "*-adm"}
-
-.PARAMETER T0ComputerFilter
-    Filter for identifying T0 computer accounts. Default: PKI, ADFS, AADConnect patterns
-
 .PARAMETER IncludeInherited
-    Include inherited permissions in the report. Default: $false
-
-.PARAMETER T0UserGroupDN
-    DN of a group containing T0 users. Using group membership is MUCH faster than pattern matching.
-
-.PARAMETER T0ComputerGroupDN
-    DN of a group containing T0 computers. Using group membership is MUCH faster than pattern matching.
-
-.PARAMETER SkipT0Users
-    Skip T0 user account scanning. Useful when you only need to audit DCs and infrastructure.
-
-.PARAMETER SkipT0Computers
-    Skip T0 computer account scanning. Domain Controllers are always included.
-
-.PARAMETER T0SearchBase
-    Limit T0 account search to a specific OU. Significantly faster in large environments.
-
-.PARAMETER UseAuthNPolicyAssignment
-    RECOMMENDED: Identify T0 objects by checking which accounts have Authentication Policies
-    or Silos assigned. This is the most accurate method as it uses your actual T0 definitions.
-    Detects: msDS-AssignedAuthNPolicy, msDS-AssignedAuthNPolicySilo, and Silo membership.
-
-.PARAMETER IncludePatternMatching
-    When used with -UseAuthNPolicyAssignment, also includes pattern-based detection.
-    Useful for finding T0 assets that should have policies but don't yet.
-
-.PARAMETER IncludeGapAnalysis
-    IMPORTANT: Run T0 Coverage Gap Analysis to identify privileged accounts (Domain Admins,
-    Enterprise Admins, Schema Admins, etc.) that are NOT protected by Authentication Policy
-    or Silo. These unprotected accounts can authenticate from any device, creating a security gap.
+    Include inherited permissions in the ACL audit. Default: $false
 
 .PARAMETER AdditionalPrivilegedGroups
-    Additional privileged groups to include in gap analysis. Array of group names or DNs.
-    Example: @("SQL Admins", "Exchange Admins", "CN=CustomAdmins,OU=Groups,DC=domain,DC=com")
+    Additional privileged groups to include in the audit.
 
 .EXAMPLE
     .\Invoke-T0AuthNSecurityAudit.ps1
-    Basic usage - audits all AuthN Policies, Silos, DCs, and T0 accounts matching default patterns.
+    Run full T0 security audit with default settings.
 
 .EXAMPLE
-    .\Invoke-T0AuthNSecurityAudit.ps1 -UseAuthNPolicyAssignment
-    RECOMMENDED: Identifies T0 by actual AuthN Policy/Silo assignments (most accurate).
+    .\Invoke-T0AuthNSecurityAudit.ps1 -OutputPath "D:\Audits"
+    Run audit with custom output path.
 
 .EXAMPLE
-    .\Invoke-T0AuthNSecurityAudit.ps1 -OutputPath "D:\Audits\T0" -IncludeInherited
-    Custom output path and include inherited permissions.
-
-.EXAMPLE
-    .\Invoke-T0AuthNSecurityAudit.ps1 -T0UserGroupDN "CN=Tier0-Users,OU=Groups,DC=contoso,DC=com"
-    Use group membership for T0 users (much faster than pattern matching).
-
-.EXAMPLE
-    .\Invoke-T0AuthNSecurityAudit.ps1 -SkipT0Users -SkipT0Computers
-    Only audit AuthN Policies, Silos, and Domain Controllers (fastest option).
-
-.EXAMPLE
-    .\Invoke-T0AuthNSecurityAudit.ps1 -T0SearchBase "OU=Tier0,DC=contoso,DC=com"
-    Limit T0 account search to a specific OU.
-
-.EXAMPLE
-    .\Invoke-T0AuthNSecurityAudit.ps1 -IncludeGapAnalysis
-    Run gap analysis to find privileged accounts NOT protected by AuthN Policy/Silo.
-
-.EXAMPLE
-    .\Invoke-T0AuthNSecurityAudit.ps1 -UseAuthNPolicyAssignment -IncludeGapAnalysis
-    RECOMMENDED: Full audit using policy-based T0 detection plus gap analysis.
-
-.EXAMPLE
-    .\Invoke-T0AuthNSecurityAudit.ps1 -IncludeGapAnalysis -AdditionalPrivilegedGroups @("SQL Admins", "Exchange Organization Administrators")
-    Gap analysis including custom privileged groups specific to your environment.
+    .\Invoke-T0AuthNSecurityAudit.ps1 -AdditionalPrivilegedGroups @("SQL Admins", "Exchange Admins")
+    Include additional groups in the privileged account analysis.
 
 .NOTES
     Author: T0 Security Team
-    Version: 1.0
+    Version: 2.0
     Requires: ActiveDirectory module, AD: PSDrive access
 
-    CRITICAL FINDINGS (Red):
-    - GenericAll: Full control over object
-    - WriteDACL: Can modify permissions
-    - WriteOwner: Can take ownership
-    - Non-inherited permissions from non-standard principals
-
-    HIGH FINDINGS (Orange):
-    - GenericWrite: Can write all properties
-    - WriteProperty with broad scope (all properties)
-
-    MEDIUM FINDINGS (Yellow):
-    - WriteProperty on specific sensitive attributes
-    - ExtendedRight permissions
+    Severity Classification:
+    - CRITICAL: Unauthorized identity with modify rights on T0 objects
+    - WARNING: T0 Pollution (non-DC in T0 server group)
+    - INFO: Expected permissions (SYSTEM, Domain Admins, Enterprise Admins)
 #>
 
-[CmdletBinding()]
-param(
-    [Parameter()]
-    [string]$OutputPath = "C:\T0_Audit",
+#region Script Variables
 
-    [Parameter()]
-    [switch]$IncludeInherited = $false,
-
-    [Parameter()]
-    [string[]]$T0UserPatterns = @("*-T0", "*-adm", "*-admin", "T0-*", "Admin-*"),
-
-    [Parameter()]
-    [string[]]$T0ComputerPatterns = @("*PKI*", "*ADFS*", "*AADConnect*", "*AADC*", "*CA*", "*CertAuth*", "*EntraConnect*"),
-
-    [Parameter(HelpMessage = "DN of group containing T0 users (faster than pattern matching)")]
-    [string]$T0UserGroupDN,
-
-    [Parameter(HelpMessage = "DN of group containing T0 computers (faster than pattern matching)")]
-    [string]$T0ComputerGroupDN,
-
-    [Parameter(HelpMessage = "Skip T0 user account scanning")]
-    [switch]$SkipT0Users = $false,
-
-    [Parameter(HelpMessage = "Skip T0 computer account scanning (DCs are always included)")]
-    [switch]$SkipT0Computers = $false,
-
-    [Parameter(HelpMessage = "Search only in specific OU for T0 accounts")]
-    [string]$T0SearchBase,
-
-    [Parameter(HelpMessage = "Use AuthN Policy/Silo assignments to identify T0 (recommended, most accurate)")]
-    [switch]$UseAuthNPolicyAssignment = $false,
-
-    [Parameter(HelpMessage = "Also include pattern matching when using -UseAuthNPolicyAssignment")]
-    [switch]$IncludePatternMatching = $false,
-
-    [Parameter(HelpMessage = "Run T0 Coverage Gap Analysis - find privileged accounts NOT protected by AuthN Policy/Silo")]
-    [switch]$IncludeGapAnalysis = $false,
-
-    [Parameter(HelpMessage = "Additional privileged groups to check in gap analysis (array of group names or DNs)")]
-    [string[]]$AdditionalPrivilegedGroups = @()
-)
-
-#region Configuration
-
-# Standard/Expected principals that typically have permissions (customize as needed)
-$Script:StandardPrincipals = @(
-    "NT AUTHORITY\\SYSTEM",
-    "NT AUTHORITY\\SELF",
-    "NT AUTHORITY\\ENTERPRISE DOMAIN CONTROLLERS",
-    "NT AUTHORITY\\Authenticated Users",
-    "BUILTIN\\Administrators",
-    "BUILTIN\\Account Operators",
-    "BUILTIN\\Server Operators"
-)
-
-# Domain-specific standard groups (will be populated dynamically)
-$Script:DomainAdminGroups = @()
-
-# GUID mappings for common schema attributes
-$Script:AttributeGUIDs = @{
-    "00000000-0000-0000-0000-000000000000" = "All Properties"
-    "5e6034a2-6db5-4ab6-a2bf-11e06d5cd65a" = "msDS-AssignedAuthNPolicy"
-    "d0e8f5b5-5a4e-4bc1-a4f6-2f1c68a5e2a3" = "msDS-AssignedAuthNPolicySilo"
-    "bf967a86-0de6-11d0-a285-00aa003049e2" = "Computer"
-    "bf967aba-0de6-11d0-a285-00aa003049e2" = "User"
+# Well-known SIDs
+$Script:WellKnownSIDs = @{
+    "S-1-5-18"     = "NT AUTHORITY\SYSTEM"
+    "S-1-5-11"     = "NT AUTHORITY\Authenticated Users"
+    "S-1-1-0"      = "Everyone"
+    "S-1-5-10"     = "NT AUTHORITY\SELF"
 }
 
-# Rights severity classification
-$Script:CriticalRights = @("GenericAll", "WriteDacl", "WriteOwner", "GenericWrite")
-$Script:HighRights = @("WriteProperty", "Self", "ExtendedRight", "CreateChild", "DeleteChild", "Delete")
-$Script:MediumRights = @("ReadProperty", "ReadControl", "ListChildren")
+# Domain-specific variables (populated at runtime)
+$Script:DomainInfo = $null
+$Script:DomainSID = $null
+$Script:ConfigNC = $null
+
+# T0 Discovery Results
+$Script:T0Policies = [System.Collections.ArrayList]::new()
+$Script:T0Silos = [System.Collections.ArrayList]::new()
+$Script:T0InfrastructureGroups = [System.Collections.ArrayList]::new()
+$Script:T0InfrastructureComputers = [System.Collections.ArrayList]::new()
+$Script:PrivilegedUsers = [System.Collections.ArrayList]::new()
+$Script:DomainControllers = [System.Collections.ArrayList]::new()
 
 #endregion
 
@@ -193,10 +104,11 @@ function Initialize-AuditEnvironment {
         Initialize the audit environment and validate prerequisites
     #>
 
-    Write-Host "`n" -NoNewline
-    Write-Host "=" * 70 -ForegroundColor Cyan
-    Write-Host "  T0 Authentication Security Infrastructure Audit" -ForegroundColor Cyan
-    Write-Host "=" * 70 -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "=" * 80 -ForegroundColor Cyan
+    Write-Host "  T0 Authentication Security Infrastructure Audit v2.0" -ForegroundColor Cyan
+    Write-Host "  Dynamic Discovery Mode - No Static Filters" -ForegroundColor Cyan
+    Write-Host "=" * 80 -ForegroundColor Cyan
     Write-Host ""
 
     # Check for ActiveDirectory module
@@ -208,653 +120,472 @@ function Initialize-AuditEnvironment {
 
     # Verify AD: PSDrive is available
     if (-not (Get-PSDrive -Name AD -ErrorAction SilentlyContinue)) {
-        throw "AD: PSDrive is not available. Ensure you have the ActiveDirectory module properly configured."
+        throw "AD: PSDrive is not available. Ensure the ActiveDirectory module is properly configured."
     }
 
-    # Create output directory if it doesn't exist
+    # Create output directory
     if (-not (Test-Path $OutputPath)) {
         New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
         Write-Host "[+] Created output directory: $OutputPath" -ForegroundColor Green
     }
 
     # Get domain information
-    $Script:Domain = Get-ADDomain
-    $Script:DomainDN = $Script:Domain.DistinguishedName
-    $Script:DomainNetBIOS = $Script:Domain.NetBIOSName
+    $Script:DomainInfo = Get-ADDomain
+    $Script:DomainSID = $Script:DomainInfo.DomainSID.Value
+    $Script:ConfigNC = (Get-ADRootDSE).configurationNamingContext
 
-    # Populate domain admin groups
-    $Script:DomainAdminGroups = @(
-        "$($Script:DomainNetBIOS)\\Domain Admins",
-        "$($Script:DomainNetBIOS)\\Enterprise Admins",
-        "$($Script:DomainNetBIOS)\\Schema Admins",
-        "$($Script:DomainNetBIOS)\\Administrators",
-        "Domain Admins",
-        "Enterprise Admins",
-        "Schema Admins"
-    )
-
-    Write-Host "[+] Connected to domain: $($Script:Domain.DNSRoot)" -ForegroundColor Green
+    Write-Host "[+] Connected to domain: $($Script:DomainInfo.DNSRoot)" -ForegroundColor Green
+    Write-Host "[+] Domain SID: $Script:DomainSID" -ForegroundColor Green
     Write-Host "[+] Output path: $OutputPath" -ForegroundColor Green
     Write-Host ""
+}
+
+function Test-IsExpectedT0Manager {
+    <#
+    .SYNOPSIS
+        Check if an identity is an expected T0 manager (should have permissions)
+    #>
+    param(
+        [string]$IdentityReference,
+        [string]$IdentitySID
+    )
+
+    # SYSTEM is always expected
+    if ($IdentitySID -eq "S-1-5-18" -or $IdentityReference -match "NT AUTHORITY\\SYSTEM") {
+        return @{ IsExpected = $true; Reason = "SYSTEM - Required for AD operations" }
+    }
+
+    # Enterprise Admins
+    if ($IdentitySID -eq "$Script:DomainSID-519" -or $IdentityReference -match "Enterprise Admins") {
+        return @{ IsExpected = $true; Reason = "Enterprise Admins - Designated T0 managers" }
+    }
+
+    # Domain Admins
+    if ($IdentitySID -eq "$Script:DomainSID-512" -or $IdentityReference -match "Domain Admins") {
+        return @{ IsExpected = $true; Reason = "Domain Admins - Designated T0 managers" }
+    }
+
+    # Schema Admins
+    if ($IdentitySID -eq "$Script:DomainSID-518" -or $IdentityReference -match "Schema Admins") {
+        return @{ IsExpected = $true; Reason = "Schema Admins - Designated T0 managers" }
+    }
+
+    # BUILTIN\Administrators
+    if ($IdentitySID -eq "S-1-5-32-544" -or $IdentityReference -match "BUILTIN\\Administrators") {
+        return @{ IsExpected = $true; Reason = "Built-in Administrators" }
+    }
+
+    return @{ IsExpected = $false; Reason = "Unexpected identity" }
+}
+
+function Test-IsReadOnlyPermission {
+    <#
+    .SYNOPSIS
+        Check if permission is read-only (non-modifying)
+    #>
+    param([string]$Rights)
+
+    $readOnlyRights = @("ReadProperty", "ReadControl", "ListChildren", "ListObject", "GenericRead")
+
+    foreach ($right in $readOnlyRights) {
+        if ($Rights -match $right -and $Rights -notmatch "Write|GenericAll|Delete|Create") {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Get-SeverityLevel {
     <#
     .SYNOPSIS
-        Determine severity level based on rights and inheritance
+        Determine severity level with contextual awareness
     #>
     param(
         [string]$Rights,
         [string]$IdentityReference,
-        [bool]$IsInherited,
-        [string]$ObjectType,
+        [string]$IdentitySID,
         [string]$AccessControlType
     )
 
-    # Deny permissions are generally protective, lower severity
+    # Deny permissions are protective
     if ($AccessControlType -eq "Deny") {
-        return "Info"
+        return @{ Severity = "Info"; Reason = "Deny ACE (protective)" }
     }
 
-    # Check if it's a standard/expected principal
-    $IsStandardPrincipal = $false
-    foreach ($principal in ($Script:StandardPrincipals + $Script:DomainAdminGroups)) {
-        if ($IdentityReference -like "*$principal*" -or $IdentityReference -match [regex]::Escape($principal)) {
-            $IsStandardPrincipal = $true
-            break
+    # Check if read-only
+    if (Test-IsReadOnlyPermission -Rights $Rights) {
+        return @{ Severity = "Info"; Reason = "Read-only permission" }
+    }
+
+    # Check if expected T0 manager
+    $expectedCheck = Test-IsExpectedT0Manager -IdentityReference $IdentityReference -IdentitySID $IdentitySID
+    if ($expectedCheck.IsExpected) {
+        return @{ Severity = "Healthy"; Reason = $expectedCheck.Reason }
+    }
+
+    # Check for dangerous rights from unexpected identities
+    $dangerousRights = @("GenericAll", "WriteDacl", "WriteOwner", "GenericWrite", "WriteProperty")
+    foreach ($dangerousRight in $dangerousRights) {
+        if ($Rights -match $dangerousRight) {
+            return @{ Severity = "Critical"; Reason = "Unauthorized modify rights - Privilege escalation path!" }
         }
     }
 
-    # Non-inherited permissions from non-standard principals are more concerning
-    $InheritanceBonus = if (-not $IsInherited -and -not $IsStandardPrincipal) { 1 } else { 0 }
-
-    # Check for critical rights
-    foreach ($right in $Script:CriticalRights) {
-        if ($Rights -match $right) {
-            if ($InheritanceBonus -eq 1) {
-                return "Critical"
-            }
-            return "High"
-        }
-    }
-
-    # Check for high rights
-    foreach ($right in $Script:HighRights) {
-        if ($Rights -match $right) {
-            # WriteProperty on all properties (GUID 00000000...) is more severe
-            if ($right -eq "WriteProperty" -and $ObjectType -eq "00000000-0000-0000-0000-000000000000") {
-                return if ($InheritanceBonus -eq 1) { "High" } else { "Medium" }
-            }
-            return if ($InheritanceBonus -eq 1) { "High" } else { "Medium" }
-        }
-    }
-
-    return "Low"
+    return @{ Severity = "Medium"; Reason = "Non-standard permission" }
 }
 
-function Get-FriendlyObjectType {
+function Get-GroupFromSDDL {
     <#
     .SYNOPSIS
-        Convert GUID to friendly name
+        Extract group SIDs from an SDDL condition string
     #>
-    param([string]$GUID)
+    param([string]$SDDLCondition)
 
-    if ([string]::IsNullOrEmpty($GUID)) {
-        return "N/A"
+    $groups = [System.Collections.ArrayList]::new()
+
+    if ([string]::IsNullOrEmpty($SDDLCondition)) {
+        return $groups
     }
 
-    if ($Script:AttributeGUIDs.ContainsKey($GUID)) {
-        return $Script:AttributeGUIDs[$GUID]
-    }
+    # Pattern to match SIDs in SDDL
+    $sidPattern = 'S-1-[0-9-]+'
+    $matches = [regex]::Matches($SDDLCondition, $sidPattern)
 
-    # Try to resolve from schema
-    try {
-        $SchemaPath = "LDAP://CN=Schema,CN=Configuration,$($Script:DomainDN)"
-        $Searcher = New-Object DirectoryServices.DirectorySearcher
-        $Searcher.SearchRoot = [ADSI]$SchemaPath
-        $Searcher.Filter = "(schemaIDGUID=\$($GUID -replace '(.{2})(.{2})(.{2})(.{2})-(.{2})(.{2})-(.{2})(.{2})-(.{2})(.{2})-(.{12})', '\4\3\2\1\6\5\8\7\9\10\11'))"
-        $Result = $Searcher.FindOne()
-        if ($Result) {
-            return $Result.Properties["ldapdisplayname"][0]
+    foreach ($match in $matches) {
+        try {
+            $sid = New-Object System.Security.Principal.SecurityIdentifier($match.Value)
+            $ntAccount = $sid.Translate([System.Security.Principal.NTAccount])
+            $null = $groups.Add([PSCustomObject]@{
+                SID = $match.Value
+                Name = $ntAccount.Value
+            })
+        }
+        catch {
+            $null = $groups.Add([PSCustomObject]@{
+                SID = $match.Value
+                Name = "(Unable to resolve)"
+            })
         }
     }
-    catch {
-        # Silently continue if resolution fails
-    }
 
-    return $GUID
-}
-
-function Test-IsNonStandardPrincipal {
-    <#
-    .SYNOPSIS
-        Check if the principal is non-standard (potentially risky)
-    #>
-    param([string]$IdentityReference)
-
-    foreach ($principal in ($Script:StandardPrincipals + $Script:DomainAdminGroups)) {
-        if ($IdentityReference -like "*$principal*" -or $IdentityReference -match [regex]::Escape($principal)) {
-            return $false
-        }
-    }
-    return $true
+    return $groups
 }
 
 #endregion
 
-#region Audit Functions
+#region Phase 1: Identity & Perimeter Discovery
 
-function Get-AuthNPolicyACLs {
+function Invoke-Phase1Discovery {
     <#
     .SYNOPSIS
-        Audit ACLs on Authentication Policy objects
+        Phase 1: Identify high-privilege users and their security boundaries
     #>
 
-    Write-Host "`n[*] Auditing Authentication Policy ACLs..." -ForegroundColor Cyan
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host "  PHASE 1: Identity & Perimeter Discovery" -ForegroundColor Yellow
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host ""
 
-    $ConfigNC = (Get-ADRootDSE).configurationNamingContext
-    $PolicyContainer = "CN=AuthN Policies,CN=AuthN Policy Configuration,CN=Services,$ConfigNC"
-
-    $Results = [System.Collections.ArrayList]::new()
-
-    # Check if container exists
+    # Step 1.1: Identify all Domain Controllers
+    Write-Host "[Phase 1.1] Identifying Domain Controllers..." -ForegroundColor Cyan
     try {
-        $Policies = Get-ADObject -SearchBase $PolicyContainer -Filter { objectClass -eq "msDS-AuthNPolicy" } -ErrorAction Stop
-    }
-    catch {
-        Write-Host "  [!] Authentication Policies container not found or empty. This may be normal if no policies are configured." -ForegroundColor Yellow
-        return $Results
-    }
+        $dcs = Get-ADComputer -Filter { PrimaryGroupID -eq 516 -or PrimaryGroupID -eq 521 } `
+            -Properties Name, DistinguishedName, DNSHostName, OperatingSystem, PrimaryGroupID, `
+                        "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo"
 
-    if (-not $Policies) {
-        Write-Host "  [!] No Authentication Policies found." -ForegroundColor Yellow
-        return $Results
-    }
-
-    $PolicyCount = ($Policies | Measure-Object).Count
-    Write-Host "  [+] Found $PolicyCount Authentication Policy objects" -ForegroundColor Green
-
-    foreach ($Policy in $Policies) {
-        Write-Host "    [-] Checking policy: $($Policy.Name)" -ForegroundColor Gray
-
-        try {
-            $ACL = Get-Acl "AD:\$($Policy.DistinguishedName)"
-
-            foreach ($Access in $ACL.Access) {
-                # Skip inherited if not requested
-                if ($Access.IsInherited -and -not $IncludeInherited) {
-                    continue
-                }
-
-                $Severity = Get-SeverityLevel -Rights $Access.ActiveDirectoryRights `
-                    -IdentityReference $Access.IdentityReference.ToString() `
-                    -IsInherited $Access.IsInherited `
-                    -ObjectType $Access.ObjectType.ToString() `
-                    -AccessControlType $Access.AccessControlType.ToString()
-
-                $null = $Results.Add([PSCustomObject]@{
-                    AuditType           = "AuthN Policy"
-                    ObjectName          = $Policy.Name
-                    ObjectDN            = $Policy.DistinguishedName
-                    IdentityReference   = $Access.IdentityReference.ToString()
-                    ActiveDirectoryRights = $Access.ActiveDirectoryRights.ToString()
-                    AccessControlType   = $Access.AccessControlType.ToString()
-                    ObjectType          = Get-FriendlyObjectType -GUID $Access.ObjectType.ToString()
-                    ObjectTypeGUID      = $Access.ObjectType.ToString()
-                    InheritedObjectType = Get-FriendlyObjectType -GUID $Access.InheritedObjectType.ToString()
-                    IsInherited         = $Access.IsInherited
-                    InheritanceFlags    = $Access.InheritanceFlags.ToString()
-                    PropagationFlags    = $Access.PropagationFlags.ToString()
-                    Severity            = $Severity
-                    IsNonStandard       = Test-IsNonStandardPrincipal -IdentityReference $Access.IdentityReference.ToString()
-                })
-            }
-        }
-        catch {
-            Write-Host "    [!] Error reading ACL for $($Policy.Name): $_" -ForegroundColor Red
-        }
-    }
-
-    return $Results
-}
-
-function Get-AuthNSiloACLs {
-    <#
-    .SYNOPSIS
-        Audit ACLs on Authentication Silo objects
-    #>
-
-    Write-Host "`n[*] Auditing Authentication Silo ACLs..." -ForegroundColor Cyan
-
-    $ConfigNC = (Get-ADRootDSE).configurationNamingContext
-    $SiloContainer = "CN=AuthN Policy Configuration,CN=Services,$ConfigNC"
-
-    $Results = [System.Collections.ArrayList]::new()
-
-    # Check if container exists
-    try {
-        $Silos = Get-ADObject -SearchBase $SiloContainer -Filter { objectClass -eq "msDS-AuthNPolicySilo" } -ErrorAction Stop
-    }
-    catch {
-        Write-Host "  [!] Authentication Silos container not found or empty. This may be normal if no silos are configured." -ForegroundColor Yellow
-        return $Results
-    }
-
-    if (-not $Silos) {
-        Write-Host "  [!] No Authentication Silos found." -ForegroundColor Yellow
-        return $Results
-    }
-
-    $SiloCount = ($Silos | Measure-Object).Count
-    Write-Host "  [+] Found $SiloCount Authentication Silo objects" -ForegroundColor Green
-
-    foreach ($Silo in $Silos) {
-        Write-Host "    [-] Checking silo: $($Silo.Name)" -ForegroundColor Gray
-
-        try {
-            $ACL = Get-Acl "AD:\$($Silo.DistinguishedName)"
-
-            foreach ($Access in $ACL.Access) {
-                if ($Access.IsInherited -and -not $IncludeInherited) {
-                    continue
-                }
-
-                $Severity = Get-SeverityLevel -Rights $Access.ActiveDirectoryRights `
-                    -IdentityReference $Access.IdentityReference.ToString() `
-                    -IsInherited $Access.IsInherited `
-                    -ObjectType $Access.ObjectType.ToString() `
-                    -AccessControlType $Access.AccessControlType.ToString()
-
-                $null = $Results.Add([PSCustomObject]@{
-                    AuditType           = "AuthN Silo"
-                    ObjectName          = $Silo.Name
-                    ObjectDN            = $Silo.DistinguishedName
-                    IdentityReference   = $Access.IdentityReference.ToString()
-                    ActiveDirectoryRights = $Access.ActiveDirectoryRights.ToString()
-                    AccessControlType   = $Access.AccessControlType.ToString()
-                    ObjectType          = Get-FriendlyObjectType -GUID $Access.ObjectType.ToString()
-                    ObjectTypeGUID      = $Access.ObjectType.ToString()
-                    InheritedObjectType = Get-FriendlyObjectType -GUID $Access.InheritedObjectType.ToString()
-                    IsInherited         = $Access.IsInherited
-                    InheritanceFlags    = $Access.InheritanceFlags.ToString()
-                    PropagationFlags    = $Access.PropagationFlags.ToString()
-                    Severity            = $Severity
-                    IsNonStandard       = Test-IsNonStandardPrincipal -IdentityReference $Access.IdentityReference.ToString()
-                })
-            }
-        }
-        catch {
-            Write-Host "    [!] Error reading ACL for $($Silo.Name): $_" -ForegroundColor Red
-        }
-    }
-
-    return $Results
-}
-
-function Get-T0PolicyAssignmentACLs {
-    <#
-    .SYNOPSIS
-        Audit rights on msDS-AssignedAuthNPolicy attribute on T0 accounts
-    #>
-
-    Write-Host "`n[*] Auditing msDS-AssignedAuthNPolicy attribute rights on T0 accounts..." -ForegroundColor Cyan
-
-    $Results = [System.Collections.ArrayList]::new()
-
-    # GUID for msDS-AssignedAuthNPolicy attribute
-    $PolicyAttrGUID = "5e6034a2-6db5-4ab6-a2bf-11e06d5cd65a"
-    $AllPropertiesGUID = "00000000-0000-0000-0000-000000000000"
-
-    # Collect T0 objects
-    $T0Objects = [System.Collections.ArrayList]::new()
-
-    # Domain Controllers (always included)
-    Write-Host "  [+] Collecting Domain Controllers..." -ForegroundColor Gray
-    try {
-        $DCs = Get-ADComputer -Filter { PrimaryGroupID -eq 516 } -Properties DistinguishedName, Name
-        foreach ($DC in $DCs) {
-            $null = $T0Objects.Add([PSCustomObject]@{
-                Name = $DC.Name
-                DN = $DC.DistinguishedName
-                Type = "Domain Controller"
+        foreach ($dc in $dcs) {
+            $dcType = if ($dc.PrimaryGroupID -eq 516) { "RWDC" } else { "RODC" }
+            $null = $Script:DomainControllers.Add([PSCustomObject]@{
+                Name = $dc.Name
+                DN = $dc.DistinguishedName
+                DNSHostName = $dc.DNSHostName
+                OperatingSystem = $dc.OperatingSystem
+                Type = $dcType
+                AuthNPolicy = $dc."msDS-AssignedAuthNPolicy"
+                AuthNPolicySilo = $dc."msDS-AssignedAuthNPolicySilo"
             })
         }
-        Write-Host "    Found $($DCs.Count) Domain Controllers" -ForegroundColor Gray
+        Write-Host "    Found $($Script:DomainControllers.Count) Domain Controllers" -ForegroundColor Green
     }
     catch {
         Write-Host "    [!] Error collecting Domain Controllers: $_" -ForegroundColor Red
     }
 
-    # T0 Detection via AuthN Policy/Silo Assignment (RECOMMENDED - most accurate)
-    if ($UseAuthNPolicyAssignment) {
-        Write-Host "  [+] Collecting T0 objects via AuthN Policy/Silo assignments (recommended method)..." -ForegroundColor Green
+    # Step 1.2: Identify High-Privilege Users (The "Big Three" + additional)
+    Write-Host "[Phase 1.2] Identifying High-Privilege Users..." -ForegroundColor Cyan
 
-        # Method 1: Find all objects with msDS-AssignedAuthNPolicy set
-        Write-Host "    [-] Finding objects with Authentication Policy assigned..." -ForegroundColor Gray
+    $privilegedGroups = @(
+        @{ Name = "Domain Admins"; Criticality = "Critical" }
+        @{ Name = "Enterprise Admins"; Criticality = "Critical" }
+        @{ Name = "Schema Admins"; Criticality = "Critical" }
+    )
+
+    # Add user-specified groups
+    foreach ($additionalGroup in $AdditionalPrivilegedGroups) {
+        $privilegedGroups += @{ Name = $additionalGroup; Criticality = "High" }
+    }
+
+    $processedUsers = @{}
+
+    foreach ($group in $privilegedGroups) {
+        Write-Host "    Checking: $($group.Name)" -ForegroundColor Gray
         try {
-            $PolicyAssignedObjects = Get-ADObject -LDAPFilter "(msDS-AssignedAuthNPolicy=*)" `
-                -Properties Name, DistinguishedName, objectClass, msDS-AssignedAuthNPolicy -ErrorAction SilentlyContinue
+            $members = Get-ADGroupMember -Identity $group.Name -Recursive -ErrorAction Stop |
+                       Where-Object { $_.objectClass -eq "user" }
 
-            foreach ($obj in $PolicyAssignedObjects) {
-                if ($T0Objects.DN -notcontains $obj.DistinguishedName) {
-                    $objType = switch ($obj.objectClass) {
-                        "user" { "T0 User (Policy Assigned)" }
-                        "computer" { "T0 Computer (Policy Assigned)" }
-                        "msDS-ManagedServiceAccount" { "T0 gMSA (Policy Assigned)" }
-                        "msDS-GroupManagedServiceAccount" { "T0 gMSA (Policy Assigned)" }
-                        default { "T0 Object (Policy Assigned)" }
+            foreach ($member in $members) {
+                if ($processedUsers.ContainsKey($member.distinguishedName)) {
+                    # Update group membership
+                    $idx = $Script:PrivilegedUsers.DN.IndexOf($member.distinguishedName)
+                    if ($idx -ge 0) {
+                        $Script:PrivilegedUsers[$idx].MemberOf += ", $($group.Name)"
                     }
-                    $null = $T0Objects.Add([PSCustomObject]@{
-                        Name = $obj.Name
-                        DN = $obj.DistinguishedName
-                        Type = $objType
-                    })
-                }
-            }
-            $PolicyCount = ($PolicyAssignedObjects | Measure-Object).Count
-            Write-Host "      Found $PolicyCount objects with AuthN Policy assigned" -ForegroundColor Gray
-        }
-        catch {
-            Write-Host "      [!] Error querying policy assignments: $_" -ForegroundColor Red
-        }
-
-        # Method 2: Find all objects with msDS-AssignedAuthNPolicySilo set
-        Write-Host "    [-] Finding objects with Authentication Silo assigned..." -ForegroundColor Gray
-        try {
-            $SiloAssignedObjects = Get-ADObject -LDAPFilter "(msDS-AssignedAuthNPolicySilo=*)" `
-                -Properties Name, DistinguishedName, objectClass, msDS-AssignedAuthNPolicySilo -ErrorAction SilentlyContinue
-
-            foreach ($obj in $SiloAssignedObjects) {
-                if ($T0Objects.DN -notcontains $obj.DistinguishedName) {
-                    $objType = switch ($obj.objectClass) {
-                        "user" { "T0 User (Silo Assigned)" }
-                        "computer" { "T0 Computer (Silo Assigned)" }
-                        "msDS-ManagedServiceAccount" { "T0 gMSA (Silo Assigned)" }
-                        "msDS-GroupManagedServiceAccount" { "T0 gMSA (Silo Assigned)" }
-                        default { "T0 Object (Silo Assigned)" }
-                    }
-                    $null = $T0Objects.Add([PSCustomObject]@{
-                        Name = $obj.Name
-                        DN = $obj.DistinguishedName
-                        Type = $objType
-                    })
-                }
-            }
-            $SiloCount = ($SiloAssignedObjects | Measure-Object).Count
-            Write-Host "      Found $SiloCount objects with AuthN Silo assigned" -ForegroundColor Gray
-        }
-        catch {
-            Write-Host "      [!] Error querying silo assignments: $_" -ForegroundColor Red
-        }
-
-        # Method 3: Get members from Authentication Silos (msDS-AuthNPolicySiloMembers)
-        Write-Host "    [-] Finding members listed in Authentication Silos..." -ForegroundColor Gray
-        try {
-            $ConfigNC = (Get-ADRootDSE).configurationNamingContext
-            $SiloContainer = "CN=AuthN Policy Configuration,CN=Services,$ConfigNC"
-
-            $Silos = Get-ADObject -SearchBase $SiloContainer -Filter { objectClass -eq "msDS-AuthNPolicySilo" } `
-                -Properties Name, "msDS-AuthNPolicySiloMembers" -ErrorAction SilentlyContinue
-
-            $SiloMemberCount = 0
-            foreach ($Silo in $Silos) {
-                $Members = $Silo."msDS-AuthNPolicySiloMembers"
-                if ($Members) {
-                    foreach ($MemberDN in $Members) {
-                        if ($T0Objects.DN -notcontains $MemberDN) {
-                            try {
-                                $MemberObj = Get-ADObject -Identity $MemberDN -Properties Name, objectClass -ErrorAction SilentlyContinue
-                                if ($MemberObj) {
-                                    $objType = switch ($MemberObj.objectClass) {
-                                        "user" { "T0 User (Silo Member: $($Silo.Name))" }
-                                        "computer" { "T0 Computer (Silo Member: $($Silo.Name))" }
-                                        "msDS-ManagedServiceAccount" { "T0 gMSA (Silo Member: $($Silo.Name))" }
-                                        "msDS-GroupManagedServiceAccount" { "T0 gMSA (Silo Member: $($Silo.Name))" }
-                                        default { "T0 Object (Silo Member: $($Silo.Name))" }
-                                    }
-                                    $null = $T0Objects.Add([PSCustomObject]@{
-                                        Name = $MemberObj.Name
-                                        DN = $MemberDN
-                                        Type = $objType
-                                    })
-                                    $SiloMemberCount++
-                                }
-                            }
-                            catch {
-                                # Object may have been deleted
-                            }
-                        }
-                    }
-                }
-            }
-            Write-Host "      Found $SiloMemberCount additional members from Silo membership lists" -ForegroundColor Gray
-        }
-        catch {
-            Write-Host "      [!] Error querying silo members: $_" -ForegroundColor Red
-        }
-
-        # If IncludePatternMatching is not set, skip pattern-based detection
-        if (-not $IncludePatternMatching) {
-            Write-Host "  [+] Skipping pattern-based detection (use -IncludePatternMatching to include)" -ForegroundColor Yellow
-            $SkipT0Users = $true
-            $SkipT0Computers = $true
-        }
-    }
-
-    # T0 User accounts (pattern-based fallback)
-    if (-not $SkipT0Users) {
-        Write-Host "  [+] Collecting T0 User accounts..." -ForegroundColor Gray
-
-        if ($T0UserGroupDN) {
-            # Fast path: Get users from group membership
-            Write-Host "    Using group membership: $T0UserGroupDN" -ForegroundColor Gray
-            try {
-                $Users = Get-ADGroupMember -Identity $T0UserGroupDN -Recursive |
-                    Where-Object { $_.objectClass -eq "user" } |
-                    Get-ADUser -Properties DistinguishedName, Name -ErrorAction SilentlyContinue
-                foreach ($User in $Users) {
-                    if ($T0Objects.DN -notcontains $User.DistinguishedName) {
-                        $null = $T0Objects.Add([PSCustomObject]@{
-                            Name = $User.Name
-                            DN = $User.DistinguishedName
-                            Type = "T0 User"
-                        })
-                    }
-                }
-                Write-Host "    Found $($Users.Count) T0 Users from group" -ForegroundColor Gray
-            }
-            catch {
-                Write-Host "    [!] Error getting group members: $_" -ForegroundColor Red
-            }
-        }
-        else {
-            # Build combined LDAP filter for all patterns (single query instead of multiple)
-            $LdapFilterParts = $T0UserPatterns | ForEach-Object { "(name=$_)" }
-            $CombinedLdapFilter = "(|$($LdapFilterParts -join ''))"
-
-            Write-Host "    Using LDAP filter: $CombinedLdapFilter" -ForegroundColor Gray
-            Write-Host "    Note: Wildcard searches can be slow in large directories." -ForegroundColor Yellow
-            Write-Host "    Tip: Use -T0UserGroupDN for faster results or -SkipT0Users to skip." -ForegroundColor Yellow
-
-            $SearchParams = @{
-                LDAPFilter = $CombinedLdapFilter
-                Properties = @("DistinguishedName", "Name")
-                ErrorAction = "SilentlyContinue"
-            }
-            if ($T0SearchBase) {
-                $SearchParams.SearchBase = $T0SearchBase
-                Write-Host "    Searching in: $T0SearchBase" -ForegroundColor Gray
-            }
-
-            try {
-                $Users = Get-ADUser @SearchParams
-                $UserCount = 0
-                foreach ($User in $Users) {
-                    if ($T0Objects.DN -notcontains $User.DistinguishedName) {
-                        $null = $T0Objects.Add([PSCustomObject]@{
-                            Name = $User.Name
-                            DN = $User.DistinguishedName
-                            Type = "T0 User"
-                        })
-                        $UserCount++
-                    }
-                }
-                Write-Host "    Found $UserCount T0 Users" -ForegroundColor Gray
-            }
-            catch {
-                Write-Host "    [!] Error collecting T0 users: $_" -ForegroundColor Red
-            }
-        }
-    }
-    else {
-        Write-Host "  [+] Skipping T0 User account collection (-SkipT0Users)" -ForegroundColor Yellow
-    }
-
-    # T0 Computer accounts
-    if (-not $SkipT0Computers) {
-        Write-Host "  [+] Collecting T0 Computer accounts..." -ForegroundColor Gray
-
-        if ($T0ComputerGroupDN) {
-            # Fast path: Get computers from group membership
-            Write-Host "    Using group membership: $T0ComputerGroupDN" -ForegroundColor Gray
-            try {
-                $Computers = Get-ADGroupMember -Identity $T0ComputerGroupDN -Recursive |
-                    Where-Object { $_.objectClass -eq "computer" } |
-                    Get-ADComputer -Properties DistinguishedName, Name -ErrorAction SilentlyContinue
-                foreach ($Computer in $Computers) {
-                    if ($T0Objects.DN -notcontains $Computer.DistinguishedName) {
-                        $null = $T0Objects.Add([PSCustomObject]@{
-                            Name = $Computer.Name
-                            DN = $Computer.DistinguishedName
-                            Type = "T0 Computer"
-                        })
-                    }
-                }
-                Write-Host "    Found $($Computers.Count) T0 Computers from group" -ForegroundColor Gray
-            }
-            catch {
-                Write-Host "    [!] Error getting group members: $_" -ForegroundColor Red
-            }
-        }
-        else {
-            # Build combined LDAP filter for all patterns (single query)
-            $LdapFilterParts = $T0ComputerPatterns | ForEach-Object { "(name=$_)" }
-            $CombinedLdapFilter = "(|$($LdapFilterParts -join ''))"
-
-            Write-Host "    Using LDAP filter: $CombinedLdapFilter" -ForegroundColor Gray
-            Write-Host "    Note: Wildcard searches can be slow in large directories." -ForegroundColor Yellow
-            Write-Host "    Tip: Use -T0ComputerGroupDN for faster results or -SkipT0Computers to skip." -ForegroundColor Yellow
-
-            $SearchParams = @{
-                LDAPFilter = $CombinedLdapFilter
-                Properties = @("DistinguishedName", "Name")
-                ErrorAction = "SilentlyContinue"
-            }
-            if ($T0SearchBase) {
-                $SearchParams.SearchBase = $T0SearchBase
-                Write-Host "    Searching in: $T0SearchBase" -ForegroundColor Gray
-            }
-
-            try {
-                $Computers = Get-ADComputer @SearchParams
-                $ComputerCount = 0
-                foreach ($Computer in $Computers) {
-                    if ($T0Objects.DN -notcontains $Computer.DistinguishedName) {
-                        $null = $T0Objects.Add([PSCustomObject]@{
-                            Name = $Computer.Name
-                            DN = $Computer.DistinguishedName
-                            Type = "T0 Computer"
-                        })
-                        $ComputerCount++
-                    }
-                }
-                Write-Host "    Found $ComputerCount T0 Computers" -ForegroundColor Gray
-            }
-            catch {
-                Write-Host "    [!] Error collecting T0 computers: $_" -ForegroundColor Red
-            }
-        }
-    }
-    else {
-        Write-Host "  [+] Skipping T0 Computer account collection (-SkipT0Computers)" -ForegroundColor Yellow
-    }
-
-    # Read-Only Domain Controllers
-    Write-Host "  [+] Collecting Read-Only Domain Controllers..." -ForegroundColor Gray
-    try {
-        $RODCs = Get-ADComputer -Filter { PrimaryGroupID -eq 521 } -Properties DistinguishedName, Name -ErrorAction SilentlyContinue
-        foreach ($RODC in $RODCs) {
-            if ($T0Objects.DN -notcontains $RODC.DistinguishedName) {
-                $null = $T0Objects.Add([PSCustomObject]@{
-                    Name = $RODC.Name
-                    DN = $RODC.DistinguishedName
-                    Type = "RODC"
-                })
-            }
-        }
-    }
-    catch {
-        # Silently continue
-    }
-
-    Write-Host "  [+] Total T0 objects to audit: $($T0Objects.Count)" -ForegroundColor Green
-
-    # Check each T0 object with progress
-    $TotalObjects = $T0Objects.Count
-    $CurrentObject = 0
-    $ProgressInterval = [Math]::Max(1, [Math]::Floor($TotalObjects / 20)) # Update progress every 5%
-
-    foreach ($T0Object in $T0Objects) {
-        $CurrentObject++
-
-        # Show progress periodically to avoid console spam
-        if ($CurrentObject % $ProgressInterval -eq 0 -or $CurrentObject -eq $TotalObjects) {
-            $PercentComplete = [Math]::Round(($CurrentObject / $TotalObjects) * 100)
-            Write-Host "    [Progress] $CurrentObject / $TotalObjects ($PercentComplete%) - Current: $($T0Object.Name)" -ForegroundColor Gray
-        }
-
-        try {
-            $ACL = Get-Acl "AD:\$($T0Object.DN)"
-
-            foreach ($Access in $ACL.Access) {
-                if ($Access.IsInherited -and -not $IncludeInherited) {
                     continue
                 }
 
-                # Check for WriteProperty on msDS-AssignedAuthNPolicy or All Properties
-                $RightsString = $Access.ActiveDirectoryRights.ToString()
-                $ObjectTypeString = $Access.ObjectType.ToString()
+                $processedUsers[$member.distinguishedName] = $true
 
-                $IsRelevantRight = $RightsString -match "WriteProperty|GenericAll|GenericWrite|WriteDacl|WriteOwner"
-                $IsRelevantAttribute = ($ObjectTypeString -eq $PolicyAttrGUID) -or
-                                       ($ObjectTypeString -eq $AllPropertiesGUID) -or
-                                       ($RightsString -match "GenericAll|GenericWrite|WriteDacl|WriteOwner")
+                # Get full user details with AuthN attributes
+                $userDetails = Get-ADUser -Identity $member.distinguishedName `
+                    -Properties Name, SamAccountName, DistinguishedName, Enabled, `
+                                "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo"
 
-                if ($IsRelevantRight -and $IsRelevantAttribute) {
-                    $Severity = Get-SeverityLevel -Rights $RightsString `
-                        -IdentityReference $Access.IdentityReference.ToString() `
-                        -IsInherited $Access.IsInherited `
-                        -ObjectType $ObjectTypeString `
-                        -AccessControlType $Access.AccessControlType.ToString()
+                $null = $Script:PrivilegedUsers.Add([PSCustomObject]@{
+                    Name = $userDetails.Name
+                    SamAccountName = $userDetails.SamAccountName
+                    DN = $userDetails.DistinguishedName
+                    Enabled = $userDetails.Enabled
+                    MemberOf = $group.Name
+                    Criticality = $group.Criticality
+                    AuthNPolicy = $userDetails."msDS-AssignedAuthNPolicy"
+                    AuthNPolicySilo = $userDetails."msDS-AssignedAuthNPolicySilo"
+                })
+            }
+        }
+        catch {
+            Write-Host "      [!] Group not found or not accessible: $($group.Name)" -ForegroundColor Yellow
+        }
+    }
+    Write-Host "    Found $($Script:PrivilegedUsers.Count) unique privileged users" -ForegroundColor Green
 
-                    $null = $Results.Add([PSCustomObject]@{
-                        AuditType           = "T0 Policy Assignment"
-                        ObjectName          = $T0Object.Name
-                        ObjectDN            = $T0Object.DN
-                        ObjectCategory      = $T0Object.Type
-                        IdentityReference   = $Access.IdentityReference.ToString()
-                        ActiveDirectoryRights = $RightsString
-                        AccessControlType   = $Access.AccessControlType.ToString()
-                        ObjectType          = Get-FriendlyObjectType -GUID $ObjectTypeString
-                        ObjectTypeGUID      = $ObjectTypeString
-                        InheritedObjectType = Get-FriendlyObjectType -GUID $Access.InheritedObjectType.ToString()
-                        IsInherited         = $Access.IsInherited
-                        InheritanceFlags    = $Access.InheritanceFlags.ToString()
-                        PropagationFlags    = $Access.PropagationFlags.ToString()
-                        Severity            = $Severity
-                        IsNonStandard       = Test-IsNonStandardPrincipal -IdentityReference $Access.IdentityReference.ToString()
-                    })
+    # Step 1.3: Discover T0 Policies and Silos from privileged user assignments
+    Write-Host "[Phase 1.3] Discovering T0 Security Boundaries (Policies & Silos)..." -ForegroundColor Cyan
+
+    $discoveredPolicies = @{}
+    $discoveredSilos = @{}
+
+    foreach ($user in $Script:PrivilegedUsers) {
+        # Track policies
+        if (-not [string]::IsNullOrEmpty($user.AuthNPolicy)) {
+            if (-not $discoveredPolicies.ContainsKey($user.AuthNPolicy)) {
+                $discoveredPolicies[$user.AuthNPolicy] = [System.Collections.ArrayList]::new()
+            }
+            $null = $discoveredPolicies[$user.AuthNPolicy].Add($user.Name)
+        }
+
+        # Track silos
+        if (-not [string]::IsNullOrEmpty($user.AuthNPolicySilo)) {
+            if (-not $discoveredSilos.ContainsKey($user.AuthNPolicySilo)) {
+                $discoveredSilos[$user.AuthNPolicySilo] = [System.Collections.ArrayList]::new()
+            }
+            $null = $discoveredSilos[$user.AuthNPolicySilo].Add($user.Name)
+        }
+    }
+
+    # Get full details for discovered policies
+    foreach ($policyDN in $discoveredPolicies.Keys) {
+        try {
+            $policy = Get-ADObject -Identity $policyDN `
+                -Properties Name, DistinguishedName, Description, `
+                            "msDS-UserAllowedToAuthenticateFrom", "msDS-UserAllowedToAuthenticateTo", `
+                            "msDS-UserTGTLifetime", "msDS-ComputerAllowedToAuthenticateTo", `
+                            "msDS-ServiceAllowedToAuthenticateFrom", "msDS-ServiceAllowedToAuthenticateTo"
+
+            $null = $Script:T0Policies.Add([PSCustomObject]@{
+                Name = $policy.Name
+                DN = $policy.DistinguishedName
+                Description = $policy.Description
+                UserAllowedToAuthenticateFrom = $policy."msDS-UserAllowedToAuthenticateFrom"
+                UserAllowedToAuthenticateTo = $policy."msDS-UserAllowedToAuthenticateTo"
+                UserTGTLifetime = $policy."msDS-UserTGTLifetime"
+                AssignedUsers = $discoveredPolicies[$policyDN]
+                DiscoverySource = "Privileged User Assignment"
+            })
+        }
+        catch {
+            Write-Host "      [!] Could not read policy: $policyDN" -ForegroundColor Yellow
+        }
+    }
+    Write-Host "    Found $($Script:T0Policies.Count) T0 Authentication Policies" -ForegroundColor Green
+
+    # Get full details for discovered silos
+    foreach ($siloDN in $discoveredSilos.Keys) {
+        try {
+            $silo = Get-ADObject -Identity $siloDN `
+                -Properties Name, DistinguishedName, Description, `
+                            "msDS-AuthNPolicySiloMembers", "msDS-AuthNPolicySiloEnforced", `
+                            "msDS-ComputerAuthNPolicy", "msDS-ServiceAuthNPolicy", "msDS-UserAuthNPolicy"
+
+            $null = $Script:T0Silos.Add([PSCustomObject]@{
+                Name = $silo.Name
+                DN = $silo.DistinguishedName
+                Description = $silo.Description
+                IsEnforced = $silo."msDS-AuthNPolicySiloEnforced"
+                Members = $silo."msDS-AuthNPolicySiloMembers"
+                ComputerPolicy = $silo."msDS-ComputerAuthNPolicy"
+                ServicePolicy = $silo."msDS-ServiceAuthNPolicy"
+                UserPolicy = $silo."msDS-UserAuthNPolicy"
+                AssignedUsers = $discoveredSilos[$siloDN]
+                DiscoverySource = "Privileged User Assignment"
+            })
+        }
+        catch {
+            Write-Host "      [!] Could not read silo: $siloDN" -ForegroundColor Yellow
+        }
+    }
+    Write-Host "    Found $($Script:T0Silos.Count) T0 Authentication Silos" -ForegroundColor Green
+
+    # Step 1.4: Extract Infrastructure Groups from Policies
+    Write-Host "[Phase 1.4] Extracting T0 Infrastructure Groups from Policies..." -ForegroundColor Cyan
+
+    foreach ($policy in $Script:T0Policies) {
+        $userAllowedFrom = $policy.UserAllowedToAuthenticateFrom
+
+        if (-not [string]::IsNullOrEmpty($userAllowedFrom)) {
+            Write-Host "    Policy '$($policy.Name)' has User Sign-On restriction" -ForegroundColor Gray
+
+            # Extract groups from the SDDL condition
+            $groups = Get-GroupFromSDDL -SDDLCondition $userAllowedFrom
+
+            foreach ($group in $groups) {
+                # Check if this is a group (not a built-in SID)
+                if ($group.SID -notmatch "^S-1-5-[0-9]+$" -and $group.SID -notmatch "^S-1-1-0$") {
+                    try {
+                        # Try to get as AD group
+                        $adGroup = Get-ADGroup -Identity $group.SID -Properties Members -ErrorAction SilentlyContinue
+                        if ($adGroup) {
+                            $null = $Script:T0InfrastructureGroups.Add([PSCustomObject]@{
+                                Name = $adGroup.Name
+                                DN = $adGroup.DistinguishedName
+                                SID = $group.SID
+                                SourcePolicy = $policy.Name
+                            })
+                            Write-Host "      Found infrastructure group: $($adGroup.Name)" -ForegroundColor Green
+                        }
+                    }
+                    catch {
+                        # Not a group or can't be resolved
+                    }
                 }
+            }
+        }
+    }
+    Write-Host "    Found $($Script:T0InfrastructureGroups.Count) T0 Infrastructure Groups" -ForegroundColor Green
+
+    # Step 1.5: Get all computers in T0 Infrastructure Groups
+    Write-Host "[Phase 1.5] Mapping T0 Infrastructure Computers..." -ForegroundColor Cyan
+
+    $processedComputers = @{}
+
+    foreach ($group in $Script:T0InfrastructureGroups) {
+        try {
+            $members = Get-ADGroupMember -Identity $group.DN -Recursive -ErrorAction SilentlyContinue |
+                       Where-Object { $_.objectClass -eq "computer" }
+
+            foreach ($member in $members) {
+                if ($processedComputers.ContainsKey($member.distinguishedName)) {
+                    continue
+                }
+                $processedComputers[$member.distinguishedName] = $true
+
+                $computer = Get-ADComputer -Identity $member.distinguishedName `
+                    -Properties Name, DistinguishedName, DNSHostName, OperatingSystem, PrimaryGroupID
+
+                $isDC = ($computer.PrimaryGroupID -eq 516 -or $computer.PrimaryGroupID -eq 521)
+
+                $null = $Script:T0InfrastructureComputers.Add([PSCustomObject]@{
+                    Name = $computer.Name
+                    DN = $computer.DistinguishedName
+                    DNSHostName = $computer.DNSHostName
+                    OperatingSystem = $computer.OperatingSystem
+                    IsDomainController = $isDC
+                    SourceGroup = $group.Name
+                })
+            }
+        }
+        catch {
+            Write-Host "      [!] Error reading group members: $($group.Name)" -ForegroundColor Yellow
+        }
+    }
+    Write-Host "    Found $($Script:T0InfrastructureComputers.Count) computers in T0 Infrastructure Groups" -ForegroundColor Green
+
+    Write-Host ""
+    Write-Host "[Phase 1 Complete] Discovery Summary:" -ForegroundColor Green
+    Write-Host "    Domain Controllers:      $($Script:DomainControllers.Count)" -ForegroundColor White
+    Write-Host "    Privileged Users:        $($Script:PrivilegedUsers.Count)" -ForegroundColor White
+    Write-Host "    T0 Policies:             $($Script:T0Policies.Count)" -ForegroundColor White
+    Write-Host "    T0 Silos:                $($Script:T0Silos.Count)" -ForegroundColor White
+    Write-Host "    T0 Infrastructure Groups: $($Script:T0InfrastructureGroups.Count)" -ForegroundColor White
+    Write-Host "    T0 Infrastructure Computers: $($Script:T0InfrastructureComputers.Count)" -ForegroundColor White
+    Write-Host ""
+}
+
+#endregion
+
+#region Phase 2: Security Object ACL Audit
+
+function Invoke-Phase2ACLAudit {
+    <#
+    .SYNOPSIS
+        Phase 2: Audit ACLs on T0 Policies and Silos
+    #>
+
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host "  PHASE 2: Security Object ACL Audit" -ForegroundColor Yellow
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host ""
+
+    $Results = [System.Collections.ArrayList]::new()
+
+    # Audit T0 Policies
+    Write-Host "[Phase 2.1] Auditing ACLs on T0 Authentication Policies..." -ForegroundColor Cyan
+
+    foreach ($policy in $Script:T0Policies) {
+        Write-Host "    Checking: $($policy.Name)" -ForegroundColor Gray
+
+        try {
+            $acl = Get-Acl "AD:\$($policy.DN)"
+
+            foreach ($ace in $acl.Access) {
+                if ($ace.IsInherited -and -not $IncludeInherited) {
+                    continue
+                }
+
+                $identityRef = $ace.IdentityReference.ToString()
+                $identitySID = ""
+                try {
+                    $ntAccount = New-Object System.Security.Principal.NTAccount($identityRef)
+                    $identitySID = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                }
+                catch { }
+
+                $severityResult = Get-SeverityLevel -Rights $ace.ActiveDirectoryRights.ToString() `
+                    -IdentityReference $identityRef `
+                    -IdentitySID $identitySID `
+                    -AccessControlType $ace.AccessControlType.ToString()
+
+                $null = $Results.Add([PSCustomObject]@{
+                    ObjectType = "Authentication Policy"
+                    ObjectName = $policy.Name
+                    ObjectDN = $policy.DN
+                    IdentityReference = $identityRef
+                    IdentitySID = $identitySID
+                    Rights = $ace.ActiveDirectoryRights.ToString()
+                    AccessControlType = $ace.AccessControlType.ToString()
+                    IsInherited = $ace.IsInherited
+                    Severity = $severityResult.Severity
+                    Reason = $severityResult.Reason
+                })
             }
         }
         catch {
@@ -862,320 +593,326 @@ function Get-T0PolicyAssignmentACLs {
         }
     }
 
-    return $Results
-}
+    # Audit T0 Silos
+    Write-Host "[Phase 2.2] Auditing ACLs on T0 Authentication Silos..." -ForegroundColor Cyan
 
-function Get-T0CoverageGapAnalysis {
-    <#
-    .SYNOPSIS
-        Analyze privileged accounts that are NOT protected by Authentication Policy/Silo
-    #>
-
-    Write-Host "`n[*] Running T0 Coverage Gap Analysis..." -ForegroundColor Cyan
-    Write-Host "    Checking if privileged accounts are protected by AuthN Policy/Silo" -ForegroundColor Gray
-
-    $Results = [System.Collections.ArrayList]::new()
-
-    # Define privileged groups to check
-    $PrivilegedGroups = @(
-        @{ Name = "Domain Admins"; Criticality = "Critical"; Description = "Full domain control" }
-        @{ Name = "Enterprise Admins"; Criticality = "Critical"; Description = "Forest-wide admin rights" }
-        @{ Name = "Schema Admins"; Criticality = "Critical"; Description = "Can modify AD schema" }
-        @{ Name = "Administrators"; Criticality = "Critical"; Description = "Built-in administrators" }
-        @{ Name = "Account Operators"; Criticality = "High"; Description = "Can manage most accounts" }
-        @{ Name = "Backup Operators"; Criticality = "High"; Description = "Can backup/restore files, potential DCSync" }
-        @{ Name = "Server Operators"; Criticality = "High"; Description = "Can manage domain controllers" }
-        @{ Name = "Print Operators"; Criticality = "Medium"; Description = "Can load drivers on DCs" }
-        @{ Name = "DnsAdmins"; Criticality = "High"; Description = "Can load DLLs on DNS server (often DC)" }
-        @{ Name = "Group Policy Creator Owners"; Criticality = "High"; Description = "Can create GPOs" }
-    )
-
-    # Add any additional groups specified by user
-    foreach ($additionalGroup in $AdditionalPrivilegedGroups) {
-        $PrivilegedGroups += @{ Name = $additionalGroup; Criticality = "High"; Description = "User-specified privileged group" }
-    }
-
-    # Collect all privileged accounts
-    $PrivilegedAccounts = [System.Collections.ArrayList]::new()
-    $ProcessedDNs = @{}  # Track already processed accounts to avoid duplicates
-
-    foreach ($group in $PrivilegedGroups) {
-        Write-Host "  [+] Checking members of: $($group.Name)" -ForegroundColor Gray
+    foreach ($silo in $Script:T0Silos) {
+        Write-Host "    Checking: $($silo.Name)" -ForegroundColor Gray
 
         try {
-            # Try to get group members (handle both name and DN formats)
-            $members = $null
-            try {
-                $members = Get-ADGroupMember -Identity $group.Name -Recursive -ErrorAction Stop
-            }
-            catch {
-                # Group might not exist in this domain (e.g., Enterprise Admins in child domain)
-                Write-Host "      Group not found or not accessible: $($group.Name)" -ForegroundColor Yellow
-                continue
-            }
+            $acl = Get-Acl "AD:\$($silo.DN)"
 
-            foreach ($member in $members) {
-                # Skip if already processed
-                if ($ProcessedDNs.ContainsKey($member.distinguishedName)) {
-                    # Update group membership info
-                    $existingIdx = $PrivilegedAccounts.DN.IndexOf($member.distinguishedName)
-                    if ($existingIdx -ge 0) {
-                        $PrivilegedAccounts[$existingIdx].MemberOf += ", $($group.Name)"
-                    }
+            foreach ($ace in $acl.Access) {
+                if ($ace.IsInherited -and -not $IncludeInherited) {
                     continue
                 }
 
-                $ProcessedDNs[$member.distinguishedName] = $true
-
-                # Get full object details with AuthN Policy/Silo attributes
+                $identityRef = $ace.IdentityReference.ToString()
+                $identitySID = ""
                 try {
-                    $adObject = Get-ADObject -Identity $member.distinguishedName `
-                        -Properties Name, DistinguishedName, objectClass, SamAccountName, Enabled, `
-                                    "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo", AdminCount `
-                        -ErrorAction Stop
+                    $ntAccount = New-Object System.Security.Principal.NTAccount($identityRef)
+                    $identitySID = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                }
+                catch { }
 
-                    $null = $PrivilegedAccounts.Add([PSCustomObject]@{
-                        Name = $adObject.Name
-                        SamAccountName = $adObject.SamAccountName
-                        DN = $adObject.DistinguishedName
-                        ObjectClass = $adObject.objectClass
-                        MemberOf = $group.Name
-                        Criticality = $group.Criticality
-                        AuthNPolicy = $adObject."msDS-AssignedAuthNPolicy"
-                        AuthNPolicySilo = $adObject."msDS-AssignedAuthNPolicySilo"
-                        AdminCount = $adObject.AdminCount
-                    })
-                }
-                catch {
-                    # Object might be from another domain or deleted
-                }
+                $severityResult = Get-SeverityLevel -Rights $ace.ActiveDirectoryRights.ToString() `
+                    -IdentityReference $identityRef `
+                    -IdentitySID $identitySID `
+                    -AccessControlType $ace.AccessControlType.ToString()
+
+                $null = $Results.Add([PSCustomObject]@{
+                    ObjectType = "Authentication Silo"
+                    ObjectName = $silo.Name
+                    ObjectDN = $silo.DN
+                    IdentityReference = $identityRef
+                    IdentitySID = $identitySID
+                    Rights = $ace.ActiveDirectoryRights.ToString()
+                    AccessControlType = $ace.AccessControlType.ToString()
+                    IsInherited = $ace.IsInherited
+                    Severity = $severityResult.Severity
+                    Reason = $severityResult.Reason
+                })
             }
         }
         catch {
-            Write-Host "      [!] Error processing group $($group.Name): $_" -ForegroundColor Red
+            Write-Host "      [!] Error reading ACL: $_" -ForegroundColor Red
         }
-    }
-
-    # Also check AdminCount=1 accounts (AdminSDHolder protected)
-    Write-Host "  [+] Checking AdminSDHolder protected accounts (AdminCount=1)..." -ForegroundColor Gray
-    try {
-        $adminSDHolderAccounts = Get-ADUser -Filter { AdminCount -eq 1 } `
-            -Properties Name, DistinguishedName, SamAccountName, Enabled, `
-                        "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo", AdminCount `
-            -ErrorAction SilentlyContinue
-
-        foreach ($account in $adminSDHolderAccounts) {
-            if (-not $ProcessedDNs.ContainsKey($account.DistinguishedName)) {
-                $ProcessedDNs[$account.DistinguishedName] = $true
-                $null = $PrivilegedAccounts.Add([PSCustomObject]@{
-                    Name = $account.Name
-                    SamAccountName = $account.SamAccountName
-                    DN = $account.DistinguishedName
-                    ObjectClass = "user"
-                    MemberOf = "AdminSDHolder Protected"
-                    Criticality = "High"
-                    AuthNPolicy = $account."msDS-AssignedAuthNPolicy"
-                    AuthNPolicySilo = $account."msDS-AssignedAuthNPolicySilo"
-                    AdminCount = $account.AdminCount
-                })
-            }
-        }
-    }
-    catch {
-        Write-Host "      [!] Error querying AdminSDHolder accounts: $_" -ForegroundColor Red
-    }
-
-    # Check Domain Controllers
-    Write-Host "  [+] Checking Domain Controllers..." -ForegroundColor Gray
-    try {
-        $domainControllers = Get-ADComputer -Filter { PrimaryGroupID -eq 516 -or PrimaryGroupID -eq 521 } `
-            -Properties Name, DistinguishedName, "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo" `
-            -ErrorAction SilentlyContinue
-
-        foreach ($dc in $domainControllers) {
-            if (-not $ProcessedDNs.ContainsKey($dc.DistinguishedName)) {
-                $ProcessedDNs[$dc.DistinguishedName] = $true
-                $null = $PrivilegedAccounts.Add([PSCustomObject]@{
-                    Name = $dc.Name
-                    SamAccountName = $dc.Name + "$"
-                    DN = $dc.DistinguishedName
-                    ObjectClass = "computer"
-                    MemberOf = "Domain Controllers"
-                    Criticality = "Critical"
-                    AuthNPolicy = $dc."msDS-AssignedAuthNPolicy"
-                    AuthNPolicySilo = $dc."msDS-AssignedAuthNPolicySilo"
-                    AdminCount = $null
-                })
-            }
-        }
-    }
-    catch {
-        Write-Host "      [!] Error querying Domain Controllers: $_" -ForegroundColor Red
-    }
-
-    Write-Host "  [+] Found $($PrivilegedAccounts.Count) privileged accounts/computers to analyze" -ForegroundColor Green
-
-    # Check Silo membership lists (some accounts might be in silo but not have attribute set)
-    $SiloMembers = @{}
-    try {
-        $ConfigNC = (Get-ADRootDSE).configurationNamingContext
-        $SiloContainer = "CN=AuthN Policy Configuration,CN=Services,$ConfigNC"
-        $Silos = Get-ADObject -SearchBase $SiloContainer -Filter { objectClass -eq "msDS-AuthNPolicySilo" } `
-            -Properties Name, "msDS-AuthNPolicySiloMembers" -ErrorAction SilentlyContinue
-
-        foreach ($Silo in $Silos) {
-            $members = $Silo."msDS-AuthNPolicySiloMembers"
-            if ($members) {
-                foreach ($memberDN in $members) {
-                    $SiloMembers[$memberDN] = $Silo.Name
-                }
-            }
-        }
-    }
-    catch {
-        # Silently continue
-    }
-
-    # Analyze each privileged account
-    foreach ($account in $PrivilegedAccounts) {
-        $hasPolicy = -not [string]::IsNullOrEmpty($account.AuthNPolicy)
-        $hasSilo = -not [string]::IsNullOrEmpty($account.AuthNPolicySilo)
-        $inSiloMemberList = $SiloMembers.ContainsKey($account.DN)
-
-        $isProtected = $hasPolicy -or $hasSilo -or $inSiloMemberList
-        $protectionStatus = if ($isProtected) { "Protected" } else { "UNPROTECTED" }
-
-        $protectionDetails = @()
-        if ($hasPolicy) {
-            # Extract policy name from DN
-            $policyName = ($account.AuthNPolicy -split ",")[0] -replace "CN=", ""
-            $protectionDetails += "Policy: $policyName"
-        }
-        if ($hasSilo) {
-            $siloName = ($account.AuthNPolicySilo -split ",")[0] -replace "CN=", ""
-            $protectionDetails += "Silo: $siloName"
-        }
-        if ($inSiloMemberList -and -not $hasSilo) {
-            $protectionDetails += "Silo Member: $($SiloMembers[$account.DN])"
-        }
-        if (-not $isProtected) {
-            $protectionDetails += "No AuthN Policy or Silo assigned!"
-        }
-
-        $severity = if (-not $isProtected) {
-            if ($account.Criticality -eq "Critical") { "Critical" }
-            elseif ($account.Criticality -eq "High") { "High" }
-            else { "Medium" }
-        } else {
-            "Info"
-        }
-
-        $null = $Results.Add([PSCustomObject]@{
-            AccountName = $account.Name
-            SamAccountName = $account.SamAccountName
-            ObjectType = $account.ObjectClass
-            PrivilegedGroup = $account.MemberOf
-            GroupCriticality = $account.Criticality
-            ProtectionStatus = $protectionStatus
-            ProtectionDetails = ($protectionDetails -join "; ")
-            HasAuthNPolicy = $hasPolicy
-            HasAuthNPolicySilo = $hasSilo
-            IsInSiloMemberList = $inSiloMemberList
-            Severity = $severity
-            DistinguishedName = $account.DN
-        })
     }
 
     # Summary
-    $unprotectedCritical = ($Results | Where-Object { $_.Severity -eq "Critical" }).Count
-    $unprotectedHigh = ($Results | Where-Object { $_.Severity -eq "High" }).Count
-    $unprotectedMedium = ($Results | Where-Object { $_.Severity -eq "Medium" }).Count
-    $protected = ($Results | Where-Object { $_.ProtectionStatus -eq "Protected" }).Count
+    $criticalCount = ($Results | Where-Object { $_.Severity -eq "Critical" }).Count
+    $healthyCount = ($Results | Where-Object { $_.Severity -eq "Healthy" }).Count
+    $infoCount = ($Results | Where-Object { $_.Severity -eq "Info" }).Count
 
     Write-Host ""
-    Write-Host "  Gap Analysis Summary:" -ForegroundColor Cyan
-    Write-Host "    Protected accounts:   $protected" -ForegroundColor Green
-    if ($unprotectedCritical -gt 0) {
-        Write-Host "    UNPROTECTED Critical: $unprotectedCritical" -ForegroundColor Red
-    }
-    if ($unprotectedHigh -gt 0) {
-        Write-Host "    UNPROTECTED High:     $unprotectedHigh" -ForegroundColor DarkYellow
-    }
-    if ($unprotectedMedium -gt 0) {
-        Write-Host "    UNPROTECTED Medium:   $unprotectedMedium" -ForegroundColor Yellow
-    }
+    Write-Host "[Phase 2 Complete] ACL Audit Summary:" -ForegroundColor Green
+    Write-Host "    Critical (Unauthorized):  $criticalCount" -ForegroundColor $(if ($criticalCount -gt 0) { "Red" } else { "Green" })
+    Write-Host "    Healthy (Expected):       $healthyCount" -ForegroundColor Green
+    Write-Host "    Informational:            $infoCount" -ForegroundColor Gray
+    Write-Host ""
 
     return $Results
 }
 
 #endregion
 
-#region Report Generation Functions
+#region Phase 3: Gap Analysis
 
-function Export-ToCSV {
-    param(
-        [Parameter(Mandatory)]
-        [System.Collections.ArrayList]$Results,
-        [Parameter(Mandatory)]
-        [string]$FileName
-    )
+function Invoke-Phase3GapAnalysis {
+    <#
+    .SYNOPSIS
+        Phase 3: Gap Analysis - Find unprotected privileged accounts and infrastructure
+    #>
 
-    $FilePath = Join-Path $OutputPath $FileName
-    $Results | Export-Csv -Path $FilePath -NoTypeInformation -Encoding UTF8
-    Write-Host "  [+] CSV exported: $FilePath" -ForegroundColor Green
-}
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host "  PHASE 3: Gap Analysis (Compliance Check)" -ForegroundColor Yellow
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host ""
 
-function Export-ToText {
-    param(
-        [Parameter(Mandatory)]
-        [System.Collections.ArrayList]$Results,
-        [Parameter(Mandatory)]
-        [string]$FileName
-    )
+    $Results = [System.Collections.ArrayList]::new()
 
-    $FilePath = Join-Path $OutputPath $FileName
-    $Results | Format-Table -AutoSize | Out-String -Width 4096 | Out-File -FilePath $FilePath -Encoding UTF8
-    Write-Host "  [+] Text exported: $FilePath" -ForegroundColor Green
-}
+    # Audit A: High-Privilege Account Gap
+    Write-Host "[Phase 3.1] Checking High-Privilege Account Protection..." -ForegroundColor Cyan
 
-function Export-ToHTML {
-    param(
-        [Parameter(Mandatory)]
-        [System.Collections.ArrayList]$AllResults,
-        [Parameter(Mandatory)]
-        [string]$FileName,
-        [Parameter()]
-        [System.Collections.ArrayList]$GapAnalysisResults = $null
-    )
+    foreach ($user in $Script:PrivilegedUsers) {
+        $hasPolicy = -not [string]::IsNullOrEmpty($user.AuthNPolicy)
+        $hasSilo = -not [string]::IsNullOrEmpty($user.AuthNPolicySilo)
+        $isProtected = $hasPolicy -or $hasSilo
 
-    $FilePath = Join-Path $OutputPath $FileName
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $status = if ($isProtected) { "Protected" } else { "UNPROTECTED" }
+        $severity = if (-not $isProtected) {
+            if ($user.Criticality -eq "Critical") { "Critical" } else { "High" }
+        } else { "Info" }
 
-    # Count findings by severity (ACL findings)
-    $CriticalCount = ($AllResults | Where-Object { $_.Severity -eq "Critical" }).Count
-    $HighCount = ($AllResults | Where-Object { $_.Severity -eq "High" }).Count
-    $MediumCount = ($AllResults | Where-Object { $_.Severity -eq "Medium" }).Count
-    $LowCount = ($AllResults | Where-Object { $_.Severity -eq "Low" }).Count
-    $InfoCount = ($AllResults | Where-Object { $_.Severity -eq "Info" }).Count
+        $protectionDetails = @()
+        if ($hasPolicy) {
+            $policyName = ($user.AuthNPolicy -split ",")[0] -replace "CN=", ""
+            $protectionDetails += "Policy: $policyName"
+        }
+        if ($hasSilo) {
+            $siloName = ($user.AuthNPolicySilo -split ",")[0] -replace "CN=", ""
+            $protectionDetails += "Silo: $siloName"
+        }
+        if (-not $isProtected) {
+            $protectionDetails += "NO POLICY ASSIGNED - Can authenticate from any device!"
+        }
 
-    # Count gap analysis findings
-    $GapCriticalCount = 0
-    $GapHighCount = 0
-    $GapMediumCount = 0
-    $GapProtectedCount = 0
-    if ($GapAnalysisResults -and $GapAnalysisResults.Count -gt 0) {
-        $GapCriticalCount = ($GapAnalysisResults | Where-Object { $_.Severity -eq "Critical" }).Count
-        $GapHighCount = ($GapAnalysisResults | Where-Object { $_.Severity -eq "High" }).Count
-        $GapMediumCount = ($GapAnalysisResults | Where-Object { $_.Severity -eq "Medium" }).Count
-        $GapProtectedCount = ($GapAnalysisResults | Where-Object { $_.ProtectionStatus -eq "Protected" }).Count
-
-        # Add gap findings to total counts
-        $CriticalCount += $GapCriticalCount
-        $HighCount += $GapHighCount
-        $MediumCount += $GapMediumCount
+        $null = $Results.Add([PSCustomObject]@{
+            GapType = "Privileged Account"
+            ObjectName = $user.Name
+            SamAccountName = $user.SamAccountName
+            ObjectDN = $user.DN
+            MemberOf = $user.MemberOf
+            Enabled = $user.Enabled
+            ProtectionStatus = $status
+            ProtectionDetails = ($protectionDetails -join "; ")
+            Severity = $severity
+        })
     }
 
-    # Generate HTML
+    $unprotectedUsers = ($Results | Where-Object { $_.GapType -eq "Privileged Account" -and $_.ProtectionStatus -eq "UNPROTECTED" }).Count
+    Write-Host "    Privileged users without policy: $unprotectedUsers" -ForegroundColor $(if ($unprotectedUsers -gt 0) { "Red" } else { "Green" })
+
+    # Audit B: Domain Controller Infrastructure Gap
+    Write-Host "[Phase 3.2] Checking Domain Controller Infrastructure Protection..." -ForegroundColor Cyan
+
+    # Build list of computers in T0 infrastructure groups
+    $t0ComputerDNs = $Script:T0InfrastructureComputers | ForEach-Object { $_.DN }
+
+    foreach ($dc in $Script:DomainControllers) {
+        $inT0Group = $t0ComputerDNs -contains $dc.DN
+        $hasPolicy = -not [string]::IsNullOrEmpty($dc.AuthNPolicy)
+        $hasSilo = -not [string]::IsNullOrEmpty($dc.AuthNPolicySilo)
+
+        $issues = @()
+        $severity = "Info"
+
+        if (-not $inT0Group -and $Script:T0InfrastructureGroups.Count -gt 0) {
+            $issues += "NOT in T0 Infrastructure Group - T0 Admins cannot sign on!"
+            $severity = "Critical"
+        }
+
+        if (-not $hasPolicy -and -not $hasSilo) {
+            $issues += "No AuthN Policy/Silo assigned directly"
+            if ($severity -ne "Critical") { $severity = "Warning" }
+        }
+
+        $status = if ($issues.Count -eq 0) { "Compliant" } else { "NON-COMPLIANT" }
+
+        $protectionDetails = @()
+        if ($inT0Group) { $protectionDetails += "In T0 Group: Yes" }
+        if ($hasPolicy) {
+            $policyName = ($dc.AuthNPolicy -split ",")[0] -replace "CN=", ""
+            $protectionDetails += "Policy: $policyName"
+        }
+        if ($hasSilo) {
+            $siloName = ($dc.AuthNPolicySilo -split ",")[0] -replace "CN=", ""
+            $protectionDetails += "Silo: $siloName"
+        }
+        if ($issues.Count -gt 0) {
+            $protectionDetails += "ISSUES: " + ($issues -join "; ")
+        }
+
+        $null = $Results.Add([PSCustomObject]@{
+            GapType = "Domain Controller"
+            ObjectName = $dc.Name
+            SamAccountName = $dc.Name + "$"
+            ObjectDN = $dc.DN
+            MemberOf = "Domain Controllers ($($dc.Type))"
+            Enabled = $true
+            ProtectionStatus = $status
+            ProtectionDetails = ($protectionDetails -join "; ")
+            Severity = $severity
+        })
+    }
+
+    $nonCompliantDCs = ($Results | Where-Object { $_.GapType -eq "Domain Controller" -and $_.ProtectionStatus -eq "NON-COMPLIANT" }).Count
+    Write-Host "    Non-compliant Domain Controllers: $nonCompliantDCs" -ForegroundColor $(if ($nonCompliantDCs -gt 0) { "Red" } else { "Green" })
+
+    # Audit C: Policy-to-Silo Mapping Check
+    Write-Host "[Phase 3.3] Checking Policy-to-Silo Enforcement..." -ForegroundColor Cyan
+
+    foreach ($policy in $Script:T0Policies) {
+        # Check if this policy is bound to a silo
+        $boundToSilo = $false
+        $boundSiloName = ""
+
+        foreach ($silo in $Script:T0Silos) {
+            if ($silo.UserPolicy -eq $policy.DN -or
+                $silo.ComputerPolicy -eq $policy.DN -or
+                $silo.ServicePolicy -eq $policy.DN) {
+                $boundToSilo = $true
+                $boundSiloName = $silo.Name
+                break
+            }
+        }
+
+        if (-not $boundToSilo) {
+            $null = $Results.Add([PSCustomObject]@{
+                GapType = "Policy Configuration"
+                ObjectName = $policy.Name
+                SamAccountName = "N/A"
+                ObjectDN = $policy.DN
+                MemberOf = "Authentication Policy"
+                Enabled = $true
+                ProtectionStatus = "WARNING"
+                ProtectionDetails = "Policy not bound to any Silo - May not enforce strict authentication!"
+                Severity = "Warning"
+            })
+        }
+    }
+
+    $unboundPolicies = ($Results | Where-Object { $_.GapType -eq "Policy Configuration" }).Count
+    Write-Host "    Policies not bound to Silos: $unboundPolicies" -ForegroundColor $(if ($unboundPolicies -gt 0) { "Yellow" } else { "Green" })
+
+    Write-Host ""
+    Write-Host "[Phase 3 Complete] Gap Analysis Summary:" -ForegroundColor Green
+    $criticalGaps = ($Results | Where-Object { $_.Severity -eq "Critical" }).Count
+    $warningGaps = ($Results | Where-Object { $_.Severity -eq "Warning" }).Count
+    Write-Host "    Critical Gaps: $criticalGaps" -ForegroundColor $(if ($criticalGaps -gt 0) { "Red" } else { "Green" })
+    Write-Host "    Warnings:      $warningGaps" -ForegroundColor $(if ($warningGaps -gt 0) { "Yellow" } else { "Green" })
+    Write-Host ""
+
+    return $Results
+}
+
+#endregion
+
+#region Phase 4: Access Map (Reachability Report)
+
+function Invoke-Phase4AccessMap {
+    <#
+    .SYNOPSIS
+        Phase 4: Map where T0 admins can authenticate
+    #>
+
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host "  PHASE 4: Access Map (Reachability Report)" -ForegroundColor Yellow
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host ""
+
+    $Results = [System.Collections.ArrayList]::new()
+
+    Write-Host "[Phase 4.1] Mapping T0 Admin Effective Perimeter..." -ForegroundColor Cyan
+
+    foreach ($computer in $Script:T0InfrastructureComputers) {
+        $status = if ($computer.IsDomainController) { "Expected" } else { "WARNING - T0 Pollution" }
+        $severity = if ($computer.IsDomainController) { "Info" } else { "Warning" }
+
+        $null = $Results.Add([PSCustomObject]@{
+            ComputerName = $computer.Name
+            DNSHostName = $computer.DNSHostName
+            OperatingSystem = $computer.OperatingSystem
+            IsDomainController = $computer.IsDomainController
+            SourceGroup = $computer.SourceGroup
+            Status = $status
+            Severity = $severity
+            DN = $computer.DN
+        })
+    }
+
+    # Check for DCs not in any T0 group
+    foreach ($dc in $Script:DomainControllers) {
+        $inResults = $Results | Where-Object { $_.DN -eq $dc.DN }
+        if (-not $inResults) {
+            $null = $Results.Add([PSCustomObject]@{
+                ComputerName = $dc.Name
+                DNSHostName = $dc.DNSHostName
+                OperatingSystem = $dc.OperatingSystem
+                IsDomainController = $true
+                SourceGroup = "NONE - Not in any T0 Group!"
+                Status = "CRITICAL - DC Unreachable by T0 Admins"
+                Severity = "Critical"
+                DN = $dc.DN
+            })
+        }
+    }
+
+    # Summary
+    $dcCount = ($Results | Where-Object { $_.IsDomainController }).Count
+    $nonDCCount = ($Results | Where-Object { -not $_.IsDomainController }).Count
+    $criticalCount = ($Results | Where-Object { $_.Severity -eq "Critical" }).Count
+
+    Write-Host ""
+    Write-Host "[Phase 4 Complete] Access Map Summary:" -ForegroundColor Green
+    Write-Host "    Domain Controllers in Perimeter: $dcCount" -ForegroundColor White
+    Write-Host "    Non-DC Servers (T0 Pollution):   $nonDCCount" -ForegroundColor $(if ($nonDCCount -gt 0) { "Yellow" } else { "Green" })
+    Write-Host "    Critical (DCs not reachable):    $criticalCount" -ForegroundColor $(if ($criticalCount -gt 0) { "Red" } else { "Green" })
+    Write-Host ""
+
+    return $Results
+}
+
+#endregion
+
+#region Phase 5: Report Generation
+
+function Export-HTMLReport {
+    <#
+    .SYNOPSIS
+        Phase 5: Generate comprehensive HTML report with 3 tables
+    #>
+    param(
+        [System.Collections.ArrayList]$ACLResults,
+        [System.Collections.ArrayList]$GapResults,
+        [System.Collections.ArrayList]$AccessMapResults
+    )
+
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host "  PHASE 5: Report Generation" -ForegroundColor Yellow
+    Write-Host "=" * 80 -ForegroundColor Yellow
+    Write-Host ""
+
+    $FilePath = Join-Path $OutputPath "T0_Security_Audit_Report.html"
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    # Count findings
+    $ACLCritical = ($ACLResults | Where-Object { $_.Severity -eq "Critical" }).Count
+    $GapCritical = ($GapResults | Where-Object { $_.Severity -eq "Critical" }).Count
+    $GapWarning = ($GapResults | Where-Object { $_.Severity -eq "Warning" }).Count
+    $AccessWarning = ($AccessMapResults | Where-Object { $_.Severity -eq "Warning" }).Count
+    $AccessCritical = ($AccessMapResults | Where-Object { $_.Severity -eq "Critical" }).Count
+
     $HTML = @"
 <!DOCTYPE html>
 <html lang="en">
@@ -1187,716 +924,317 @@ function Export-ToHTML {
         :root {
             --critical-color: #dc3545;
             --critical-bg: #f8d7da;
-            --high-color: #fd7e14;
-            --high-bg: #ffe5d0;
-            --medium-color: #ffc107;
-            --medium-bg: #fff3cd;
-            --low-color: #28a745;
-            --low-bg: #d4edda;
+            --warning-color: #fd7e14;
+            --warning-bg: #fff3cd;
+            --healthy-color: #28a745;
+            --healthy-bg: #d4edda;
             --info-color: #17a2b8;
             --info-bg: #d1ecf1;
         }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; color: #333; padding: 20px; }
+        .container { max-width: 1600px; margin: 0 auto; }
+        .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 20px; }
+        .header h1 { font-size: 1.8em; margin-bottom: 5px; }
+        .header .subtitle { opacity: 0.8; }
+        .header .timestamp { margin-top: 15px; font-size: 0.9em; opacity: 0.7; }
 
-        * {
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #f5f5f5;
-            color: #333;
-        }
-
-        .container {
-            max-width: 1800px;
-            margin: 0 auto;
-        }
-
-        .header {
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            color: white;
-            padding: 30px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        }
-
-        .header h1 {
-            margin: 0 0 10px 0;
-            font-size: 2em;
-        }
-
-        .header .subtitle {
-            opacity: 0.8;
-            font-size: 1.1em;
-        }
-
-        .header .timestamp {
-            margin-top: 15px;
-            font-size: 0.9em;
-            opacity: 0.7;
-        }
-
-        .summary-cards {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-
-        .summary-card {
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            text-align: center;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-            border-left: 4px solid;
-        }
-
-        .summary-card.critical { border-left-color: var(--critical-color); }
-        .summary-card.high { border-left-color: var(--high-color); }
-        .summary-card.medium { border-left-color: var(--medium-color); }
-        .summary-card.low { border-left-color: var(--low-color); }
-        .summary-card.info { border-left-color: var(--info-color); }
-
-        .summary-card .count {
-            font-size: 2.5em;
-            font-weight: bold;
-            line-height: 1;
-        }
-
+        .summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .summary-card { background: white; padding: 20px; border-radius: 10px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .summary-card .count { font-size: 2.5em; font-weight: bold; }
+        .summary-card .label { color: #666; font-size: 0.9em; }
         .summary-card.critical .count { color: var(--critical-color); }
-        .summary-card.high .count { color: var(--high-color); }
-        .summary-card.medium .count { color: var(--medium-color); }
-        .summary-card.low .count { color: var(--low-color); }
-        .summary-card.info .count { color: var(--info-color); }
+        .summary-card.warning .count { color: var(--warning-color); }
+        .summary-card.healthy .count { color: var(--healthy-color); }
 
-        .summary-card .label {
-            margin-top: 5px;
-            font-size: 0.9em;
-            color: #666;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
+        .section { background: white; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); overflow: hidden; }
+        .section-header { background: #f8f9fa; padding: 15px 20px; border-bottom: 1px solid #dee2e6; display: flex; justify-content: space-between; align-items: center; }
+        .section-header h2 { font-size: 1.2em; color: #1a1a2e; }
+        .section-header .badge { padding: 5px 12px; border-radius: 20px; font-size: 0.85em; color: white; }
+        .section-header .badge.critical { background: var(--critical-color); }
+        .section-header .badge.warning { background: var(--warning-color); }
+        .section-header .badge.healthy { background: var(--healthy-color); }
 
-        .section {
-            background: white;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-            overflow: hidden;
-        }
+        .table-container { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+        th { background: #1a1a2e; color: white; padding: 12px 15px; text-align: left; font-weight: 600; }
+        td { padding: 10px 15px; border-bottom: 1px solid #eee; }
+        tr:hover { background: #f8f9fa; }
 
-        .section-header {
-            background: #f8f9fa;
-            padding: 15px 20px;
-            border-bottom: 1px solid #dee2e6;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
+        .severity-badge { display: inline-block; padding: 4px 10px; border-radius: 4px; font-weight: 600; font-size: 0.85em; }
+        .severity-critical { background: var(--critical-bg); color: var(--critical-color); }
+        .severity-warning { background: var(--warning-bg); color: #856404; }
+        .severity-healthy { background: var(--healthy-bg); color: var(--healthy-color); }
+        .severity-info { background: var(--info-bg); color: var(--info-color); }
 
-        .section-header h2 {
-            margin: 0;
-            font-size: 1.3em;
-            color: #1a1a2e;
-        }
+        .row-critical { background: var(--critical-bg) !important; }
+        .row-warning { background: var(--warning-bg) !important; }
 
-        .section-header .badge {
-            background: #1a1a2e;
-            color: white;
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 0.85em;
-        }
+        .discovery-summary { background: #e7f3ff; border-left: 4px solid #0066cc; padding: 15px 20px; margin-bottom: 20px; border-radius: 0 10px 10px 0; }
+        .discovery-summary h3 { color: #0066cc; margin-bottom: 10px; }
+        .discovery-summary ul { list-style: none; }
+        .discovery-summary li { padding: 5px 0; }
+        .discovery-summary li::before { content: "✓ "; color: #28a745; font-weight: bold; }
 
-        .table-container {
-            overflow-x: auto;
-        }
+        .note { background: #fff3cd; border-left: 4px solid #ffc107; padding: 10px 15px; margin: 15px 0; border-radius: 0 5px 5px 0; font-size: 0.9em; }
+        .note.info { background: var(--info-bg); border-color: var(--info-color); }
 
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.9em;
-        }
+        .no-findings { padding: 40px; text-align: center; color: #28a745; }
+        .no-findings .icon { font-size: 3em; margin-bottom: 10px; }
 
-        th {
-            background: #1a1a2e;
-            color: white;
-            padding: 12px 15px;
-            text-align: left;
-            font-weight: 600;
-            white-space: nowrap;
-            position: sticky;
-            top: 0;
-        }
-
-        td {
-            padding: 10px 15px;
-            border-bottom: 1px solid #eee;
-            vertical-align: top;
-        }
-
-        tr:hover {
-            background-color: #f8f9fa;
-        }
-
-        .severity-badge {
-            display: inline-block;
-            padding: 4px 10px;
-            border-radius: 4px;
-            font-weight: 600;
-            font-size: 0.85em;
-            text-transform: uppercase;
-        }
-
-        .severity-critical {
-            background-color: var(--critical-bg);
-            color: var(--critical-color);
-        }
-
-        .severity-high {
-            background-color: var(--high-bg);
-            color: var(--high-color);
-        }
-
-        .severity-medium {
-            background-color: var(--medium-bg);
-            color: #856404;
-        }
-
-        .severity-low {
-            background-color: var(--low-bg);
-            color: var(--low-color);
-        }
-
-        .severity-info {
-            background-color: var(--info-bg);
-            color: var(--info-color);
-        }
-
-        .row-critical {
-            background-color: var(--critical-bg) !important;
-        }
-
-        .row-high {
-            background-color: var(--high-bg) !important;
-        }
-
-        .non-standard {
-            color: var(--critical-color);
-            font-weight: 600;
-        }
-
-        .rights-badge {
-            display: inline-block;
-            padding: 2px 6px;
-            margin: 1px;
-            border-radius: 3px;
-            font-size: 0.8em;
-            background: #e9ecef;
-        }
-
-        .rights-critical {
-            background: var(--critical-bg);
-            color: var(--critical-color);
-        }
-
-        .rights-high {
-            background: var(--high-bg);
-            color: var(--high-color);
-        }
-
-        .dn-cell {
-            max-width: 300px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-            font-family: 'Consolas', monospace;
-            font-size: 0.85em;
-        }
-
-        .dn-cell:hover {
-            white-space: normal;
-            word-break: break-all;
-        }
-
-        .legend {
-            background: white;
-            border-radius: 10px;
-            padding: 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-        }
-
-        .legend h3 {
-            margin-top: 0;
-            color: #1a1a2e;
-        }
-
-        .legend-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 15px;
-        }
-
-        .legend-item {
-            display: flex;
-            align-items: flex-start;
-            gap: 10px;
-        }
-
-        .legend-item .severity-badge {
-            flex-shrink: 0;
-            min-width: 80px;
-            text-align: center;
-        }
-
-        .legend-item p {
-            margin: 0;
-            color: #666;
-            font-size: 0.9em;
-        }
-
-        .filters {
-            background: white;
-            border-radius: 10px;
-            padding: 15px 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-            display: flex;
-            gap: 15px;
-            flex-wrap: wrap;
-            align-items: center;
-        }
-
-        .filters label {
-            font-weight: 600;
-            color: #1a1a2e;
-        }
-
-        .filters select, .filters input {
-            padding: 8px 12px;
-            border: 1px solid #dee2e6;
-            border-radius: 5px;
-            font-size: 0.9em;
-        }
-
-        .no-findings {
-            padding: 40px;
-            text-align: center;
-            color: #666;
-        }
-
-        .no-findings .icon {
-            font-size: 3em;
-            margin-bottom: 10px;
-        }
-
-        @media print {
-            body {
-                background: white;
-            }
-            .filters {
-                display: none;
-            }
-            .section {
-                break-inside: avoid;
-            }
-        }
+        @media print { body { background: white; } .section { break-inside: avoid; } }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
             <h1>T0 Authentication Security Infrastructure Audit</h1>
-            <div class="subtitle">ACL Analysis for Authentication Policies, Silos, and T0 Account Policy Assignments</div>
-            <div class="timestamp">Generated: $Timestamp | Domain: $($Script:Domain.DNSRoot)</div>
+            <div class="subtitle">Dynamic Discovery Mode - No Static Filters</div>
+            <div class="timestamp">Generated: $Timestamp | Domain: $($Script:DomainInfo.DNSRoot)</div>
         </div>
 
-        <div class="summary-cards">
+        <div class="summary-grid">
             <div class="summary-card critical">
-                <div class="count">$CriticalCount</div>
-                <div class="label">Critical</div>
+                <div class="count">$($ACLCritical + $GapCritical + $AccessCritical)</div>
+                <div class="label">Critical Findings</div>
             </div>
-            <div class="summary-card high">
-                <div class="count">$HighCount</div>
-                <div class="label">High</div>
+            <div class="summary-card warning">
+                <div class="count">$($GapWarning + $AccessWarning)</div>
+                <div class="label">Warnings</div>
             </div>
-            <div class="summary-card medium">
-                <div class="count">$MediumCount</div>
-                <div class="label">Medium</div>
+            <div class="summary-card healthy">
+                <div class="count">$($Script:PrivilegedUsers.Count)</div>
+                <div class="label">Privileged Users Analyzed</div>
             </div>
-            <div class="summary-card low">
-                <div class="count">$LowCount</div>
-                <div class="label">Low</div>
-            </div>
-            <div class="summary-card info">
-                <div class="count">$InfoCount</div>
-                <div class="label">Info</div>
+            <div class="summary-card">
+                <div class="count">$($Script:DomainControllers.Count)</div>
+                <div class="label">Domain Controllers</div>
             </div>
         </div>
 
-        <div class="legend">
-            <h3>Severity Legend</h3>
-            <div class="legend-grid">
-                <div class="legend-item">
-                    <span class="severity-badge severity-critical">Critical</span>
-                    <p><strong>Immediate action required.</strong> Non-inherited GenericAll, WriteDACL, or WriteOwner permissions from non-standard principals. These allow complete control over authentication security infrastructure.</p>
-                </div>
-                <div class="legend-item">
-                    <span class="severity-badge severity-high">High</span>
-                    <p><strong>Review urgently.</strong> GenericAll, WriteDACL, WriteOwner, or GenericWrite permissions. May allow modification of security policies or takeover of protected accounts.</p>
-                </div>
-                <div class="legend-item">
-                    <span class="severity-badge severity-medium">Medium</span>
-                    <p><strong>Review recommended.</strong> WriteProperty permissions on specific attributes or extended rights. Could allow targeted modifications to authentication settings.</p>
-                </div>
-                <div class="legend-item">
-                    <span class="severity-badge severity-low">Low</span>
-                    <p><strong>Informational.</strong> Read permissions or other non-modifying access. Generally expected but worth documenting.</p>
-                </div>
-                <div class="legend-item">
-                    <span class="severity-badge severity-info">Info</span>
-                    <p><strong>For reference.</strong> Deny permissions (protective) or standard inherited permissions from expected principals.</p>
-                </div>
-            </div>
+        <div class="discovery-summary">
+            <h3>Phase 1 Discovery Results</h3>
+            <ul>
+                <li>$($Script:DomainControllers.Count) Domain Controllers identified</li>
+                <li>$($Script:PrivilegedUsers.Count) Privileged Users (DA/EA/SA members)</li>
+                <li>$($Script:T0Policies.Count) T0 Authentication Policies discovered</li>
+                <li>$($Script:T0Silos.Count) T0 Authentication Silos discovered</li>
+                <li>$($Script:T0InfrastructureGroups.Count) T0 Infrastructure Groups mapped</li>
+                <li>$($Script:T0InfrastructureComputers.Count) Computers in T0 perimeter</li>
+            </ul>
         </div>
 
-        <div class="filters">
-            <label>Filter by Severity:</label>
-            <select id="severityFilter" onchange="filterTable()">
-                <option value="all">All Severities</option>
-                <option value="critical">Critical Only</option>
-                <option value="high">High & Above</option>
-                <option value="medium">Medium & Above</option>
-            </select>
-            <label>Filter by Type:</label>
-            <select id="typeFilter" onchange="filterTable()">
-                <option value="all">All Types</option>
-                <option value="AuthN Policy">AuthN Policy</option>
-                <option value="AuthN Silo">AuthN Silo</option>
-                <option value="T0 Policy Assignment">T0 Policy Assignment</option>
-                <option value="Gap Analysis">Gap Analysis</option>
-            </select>
-            <label>Search:</label>
-            <input type="text" id="searchFilter" onkeyup="filterTable()" placeholder="Search identities, objects...">
-        </div>
+        <!-- TABLE 1: ACL Trust Report -->
+        <div class="section">
+            <div class="section-header">
+                <h2>1. ACL Trust Report - Unauthorized Managers</h2>
+                <span class="badge $(if ($ACLCritical -gt 0) { 'critical' } else { 'healthy' })">$ACLCritical Critical</span>
+            </div>
+            <div class="table-container">
 "@
 
-    # Group results by audit type
-    $PolicyResults = $AllResults | Where-Object { $_.AuditType -eq "AuthN Policy" }
-    $SiloResults = $AllResults | Where-Object { $_.AuditType -eq "AuthN Silo" }
-    $T0Results = $AllResults | Where-Object { $_.AuditType -eq "T0 Policy Assignment" }
+    # Filter to show only Critical and Medium (hide Healthy/Info in main view)
+    $criticalACLs = $ACLResults | Where-Object { $_.Severity -eq "Critical" }
 
-    # Function to generate table rows
-    function Get-TableRows {
-        param($Results, $IncludeCategory = $false)
-
-        $rows = ""
-        foreach ($r in ($Results | Sort-Object @{Expression={
-            switch ($_.Severity) {
-                "Critical" { 0 }
-                "High" { 1 }
-                "Medium" { 2 }
-                "Low" { 3 }
-                "Info" { 4 }
-                default { 5 }
-            }
-        }})) {
-            $rowClass = switch ($r.Severity) {
-                "Critical" { "row-critical" }
-                "High" { "row-high" }
-                default { "" }
-            }
-
-            $severityClass = "severity-$($r.Severity.ToLower())"
-            $identityClass = if ($r.IsNonStandard) { "non-standard" } else { "" }
-
-            # Format rights with badges
-            $rightsHtml = ""
-            $rights = $r.ActiveDirectoryRights -split ", "
-            foreach ($right in $rights) {
-                $rightClass = "rights-badge"
-                if ($right -match "GenericAll|WriteDacl|WriteOwner") {
-                    $rightClass += " rights-critical"
-                } elseif ($right -match "GenericWrite|WriteProperty") {
-                    $rightClass += " rights-high"
-                }
-                $rightsHtml += "<span class='$rightClass'>$right</span> "
-            }
-
-            $categoryCell = if ($IncludeCategory) { "<td>$($r.ObjectCategory)</td>" } else { "" }
-
-            $rows += @"
-            <tr class="$rowClass" data-severity="$($r.Severity.ToLower())" data-type="$($r.AuditType)">
-                <td><span class="severity-badge $severityClass">$($r.Severity)</span></td>
-                <td>$($r.ObjectName)</td>
-                $categoryCell
-                <td class="$identityClass">$($r.IdentityReference)</td>
-                <td>$rightsHtml</td>
-                <td>$($r.AccessControlType)</td>
-                <td>$($r.ObjectType)</td>
-                <td>$($r.IsInherited)</td>
-                <td class="dn-cell" title="$($r.ObjectDN)">$($r.ObjectDN)</td>
-            </tr>
+    if ($criticalACLs.Count -gt 0) {
+        $HTML += @"
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Severity</th>
+                            <th>Object</th>
+                            <th>Type</th>
+                            <th>Unauthorized Identity</th>
+                            <th>Rights</th>
+                            <th>Risk</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+"@
+        foreach ($acl in $criticalACLs) {
+            $HTML += @"
+                        <tr class="row-critical">
+                            <td><span class="severity-badge severity-critical">CRITICAL</span></td>
+                            <td><strong>$($acl.ObjectName)</strong></td>
+                            <td>$($acl.ObjectType)</td>
+                            <td>$($acl.IdentityReference)</td>
+                            <td>$($acl.Rights)</td>
+                            <td>$($acl.Reason)</td>
+                        </tr>
 "@
         }
-        return $rows
+        $HTML += "</tbody></table>"
+    }
+    else {
+        $HTML += '<div class="no-findings"><div class="icon">✓</div>No unauthorized managers found. All T0 security objects have expected permissions.</div>'
     }
 
-    # Authentication Policies section
+    # Add note about expected permissions
+    $healthyACLs = $ACLResults | Where-Object { $_.Severity -eq "Healthy" -or $_.Severity -eq "Info" }
     $HTML += @"
+            </div>
+            <div class="note info">
+                <strong>Note:</strong> $($healthyACLs.Count) expected permissions (SYSTEM, Domain Admins, Enterprise Admins) are not shown. These are required for normal AD operations.
+            </div>
+        </div>
+
+        <!-- TABLE 2: Identity & Infrastructure Gaps -->
         <div class="section">
             <div class="section-header">
-                <h2>Authentication Policy ACLs</h2>
-                <span class="badge">$($PolicyResults.Count) findings</span>
+                <h2>2. Identity & Infrastructure Gaps</h2>
+                <span class="badge $(if ($GapCritical -gt 0) { 'critical' } elseif ($GapWarning -gt 0) { 'warning' } else { 'healthy' })">$GapCritical Critical, $GapWarning Warnings</span>
             </div>
             <div class="table-container">
 "@
 
-    if ($PolicyResults.Count -gt 0) {
+    $gapFindings = $GapResults | Where-Object { $_.Severity -ne "Info" }
+
+    if ($gapFindings.Count -gt 0) {
         $HTML += @"
                 <table>
                     <thead>
                         <tr>
                             <th>Severity</th>
-                            <th>Policy Name</th>
-                            <th>Identity</th>
-                            <th>Rights</th>
-                            <th>Type</th>
-                            <th>Object Type</th>
-                            <th>Inherited</th>
-                            <th>Distinguished Name</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        $(Get-TableRows -Results $PolicyResults)
-                    </tbody>
-                </table>
-"@
-    } else {
-        $HTML += '<div class="no-findings"><div class="icon">✓</div>No Authentication Policies found or no non-inherited ACLs detected.</div>'
-    }
-
-    $HTML += "</div></div>"
-
-    # Authentication Silos section
-    $HTML += @"
-        <div class="section">
-            <div class="section-header">
-                <h2>Authentication Silo ACLs</h2>
-                <span class="badge">$($SiloResults.Count) findings</span>
-            </div>
-            <div class="table-container">
-"@
-
-    if ($SiloResults.Count -gt 0) {
-        $HTML += @"
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Severity</th>
-                            <th>Silo Name</th>
-                            <th>Identity</th>
-                            <th>Rights</th>
-                            <th>Type</th>
-                            <th>Object Type</th>
-                            <th>Inherited</th>
-                            <th>Distinguished Name</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        $(Get-TableRows -Results $SiloResults)
-                    </tbody>
-                </table>
-"@
-    } else {
-        $HTML += '<div class="no-findings"><div class="icon">✓</div>No Authentication Silos found or no non-inherited ACLs detected.</div>'
-    }
-
-    $HTML += "</div></div>"
-
-    # T0 Policy Assignment section
-    $HTML += @"
-        <div class="section">
-            <div class="section-header">
-                <h2>T0 Account Policy Assignment Rights (msDS-AssignedAuthNPolicy)</h2>
-                <span class="badge">$($T0Results.Count) findings</span>
-            </div>
-            <div class="table-container">
-"@
-
-    if ($T0Results.Count -gt 0) {
-        $HTML += @"
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Severity</th>
-                            <th>Object Name</th>
-                            <th>Category</th>
-                            <th>Identity</th>
-                            <th>Rights</th>
-                            <th>Type</th>
-                            <th>Object Type</th>
-                            <th>Inherited</th>
-                            <th>Distinguished Name</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        $(Get-TableRows -Results $T0Results -IncludeCategory $true)
-                    </tbody>
-                </table>
-"@
-    } else {
-        $HTML += '<div class="no-findings"><div class="icon">✓</div>No T0 accounts found matching the specified patterns or no relevant ACLs detected.</div>'
-    }
-
-    $HTML += "</div></div>"
-
-    # Gap Analysis section (if available)
-    if ($GapAnalysisResults -and $GapAnalysisResults.Count -gt 0) {
-        $UnprotectedResults = $GapAnalysisResults | Where-Object { $_.ProtectionStatus -eq "UNPROTECTED" }
-        $ProtectedResults = $GapAnalysisResults | Where-Object { $_.ProtectionStatus -eq "Protected" }
-
-        $HTML += @"
-        <div class="section" style="border-left: 4px solid var(--critical-color);">
-            <div class="section-header" style="background: linear-gradient(135deg, #f8d7da 0%, #fff 100%);">
-                <h2>T0 Coverage Gap Analysis - Unprotected Privileged Accounts</h2>
-                <span class="badge" style="background: var(--critical-color);">$($UnprotectedResults.Count) UNPROTECTED</span>
-            </div>
-            <div class="table-container">
-"@
-
-        if ($UnprotectedResults.Count -gt 0) {
-            $HTML += @"
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Severity</th>
-                            <th>Account Name</th>
-                            <th>SAM Account</th>
-                            <th>Type</th>
-                            <th>Privileged Group(s)</th>
-                            <th>Protection Status</th>
+                            <th>Gap Type</th>
+                            <th>Object</th>
+                            <th>Member Of</th>
+                            <th>Status</th>
                             <th>Details</th>
                         </tr>
                     </thead>
                     <tbody>
 "@
-            foreach ($gap in ($UnprotectedResults | Sort-Object @{Expression={
-                switch ($_.Severity) { "Critical" { 0 } "High" { 1 } "Medium" { 2 } default { 3 } }
-            }})) {
-                $rowClass = switch ($gap.Severity) {
-                    "Critical" { "row-critical" }
-                    "High" { "row-high" }
-                    default { "" }
-                }
-                $severityClass = "severity-$($gap.Severity.ToLower())"
+        foreach ($gap in ($gapFindings | Sort-Object @{Expression={switch($_.Severity){"Critical"{0}"Warning"{1}default{2}}}})) {
+            $rowClass = switch ($gap.Severity) { "Critical" { "row-critical" } "Warning" { "row-warning" } default { "" } }
+            $severityClass = "severity-$($gap.Severity.ToLower())"
 
-                $HTML += @"
-                    <tr class="$rowClass" data-severity="$($gap.Severity.ToLower())" data-type="Gap Analysis">
-                        <td><span class="severity-badge $severityClass">$($gap.Severity)</span></td>
-                        <td><strong>$($gap.AccountName)</strong></td>
-                        <td>$($gap.SamAccountName)</td>
-                        <td>$($gap.ObjectType)</td>
-                        <td>$($gap.PrivilegedGroup)</td>
-                        <td><span class="severity-badge severity-critical">$($gap.ProtectionStatus)</span></td>
-                        <td>$($gap.ProtectionDetails)</td>
-                    </tr>
+            $HTML += @"
+                        <tr class="$rowClass">
+                            <td><span class="severity-badge $severityClass">$($gap.Severity.ToUpper())</span></td>
+                            <td>$($gap.GapType)</td>
+                            <td><strong>$($gap.ObjectName)</strong></td>
+                            <td>$($gap.MemberOf)</td>
+                            <td>$($gap.ProtectionStatus)</td>
+                            <td>$($gap.ProtectionDetails)</td>
+                        </tr>
 "@
-            }
-            $HTML += "</tbody></table>"
-        } else {
-            $HTML += '<div class="no-findings" style="background: #d4edda;"><div class="icon">✓</div>All privileged accounts are protected by Authentication Policy or Silo!</div>'
         }
+        $HTML += "</tbody></table>"
+    }
+    else {
+        $HTML += '<div class="no-findings"><div class="icon">✓</div>All privileged accounts and Domain Controllers are properly protected!</div>'
+    }
 
-        $HTML += "</div></div>"
+    # Show protected accounts count
+    $protectedCount = ($GapResults | Where-Object { $_.Severity -eq "Info" }).Count
+    $HTML += @"
+            </div>
+            <div class="note info">
+                <strong>Protected:</strong> $protectedCount privileged accounts/DCs are properly assigned to Authentication Policies or Silos.
+            </div>
+        </div>
 
-        # Protected accounts section (collapsible/summary)
-        $HTML += @"
+        <!-- TABLE 3: Effective Perimeter Map -->
         <div class="section">
             <div class="section-header">
-                <h2>Protected Privileged Accounts</h2>
-                <span class="badge" style="background: #28a745;">$($ProtectedResults.Count) Protected</span>
+                <h2>3. Effective Perimeter Map - T0 Admin Reachability</h2>
+                <span class="badge $(if ($AccessCritical -gt 0) { 'critical' } elseif ($AccessWarning -gt 0) { 'warning' } else { 'healthy' })">$($AccessMapResults.Count) Computers</span>
             </div>
             <div class="table-container">
 "@
 
-        if ($ProtectedResults.Count -gt 0) {
-            $HTML += @"
+    if ($AccessMapResults.Count -gt 0) {
+        $HTML += @"
                 <table>
                     <thead>
                         <tr>
                             <th>Status</th>
-                            <th>Account Name</th>
-                            <th>SAM Account</th>
-                            <th>Type</th>
-                            <th>Privileged Group(s)</th>
-                            <th>Protection Details</th>
+                            <th>Computer</th>
+                            <th>DNS Name</th>
+                            <th>Operating System</th>
+                            <th>Is DC?</th>
+                            <th>Source Group</th>
                         </tr>
                     </thead>
                     <tbody>
 "@
-            foreach ($gap in $ProtectedResults) {
-                $HTML += @"
-                    <tr data-severity="info" data-type="Gap Analysis">
-                        <td><span class="severity-badge severity-info">Protected</span></td>
-                        <td>$($gap.AccountName)</td>
-                        <td>$($gap.SamAccountName)</td>
-                        <td>$($gap.ObjectType)</td>
-                        <td>$($gap.PrivilegedGroup)</td>
-                        <td>$($gap.ProtectionDetails)</td>
-                    </tr>
-"@
-            }
-            $HTML += "</tbody></table>"
-        } else {
-            $HTML += '<div class="no-findings"><div class="icon">!</div>No privileged accounts are currently protected.</div>'
-        }
+        foreach ($comp in ($AccessMapResults | Sort-Object @{Expression={switch($_.Severity){"Critical"{0}"Warning"{1}default{2}}}}, IsDomainController -Descending)) {
+            $rowClass = switch ($comp.Severity) { "Critical" { "row-critical" } "Warning" { "row-warning" } default { "" } }
+            $severityClass = switch ($comp.Severity) { "Critical" { "severity-critical" } "Warning" { "severity-warning" } default { "severity-healthy" } }
+            $statusText = switch ($comp.Severity) { "Critical" { "CRITICAL" } "Warning" { "WARNING" } default { "OK" } }
 
-        $HTML += "</div></div>"
+            $HTML += @"
+                        <tr class="$rowClass">
+                            <td><span class="severity-badge $severityClass">$statusText</span></td>
+                            <td><strong>$($comp.ComputerName)</strong></td>
+                            <td>$($comp.DNSHostName)</td>
+                            <td>$($comp.OperatingSystem)</td>
+                            <td>$(if ($comp.IsDomainController) { '✓ Yes' } else { 'No' })</td>
+                            <td>$($comp.SourceGroup)</td>
+                        </tr>
+"@
+        }
+        $HTML += "</tbody></table>"
+    }
+    else {
+        $HTML += '<div class="no-findings"><div class="icon">⚠</div>No T0 Infrastructure Groups found. Unable to map T0 admin reachability.</div>'
     }
 
     $HTML += @"
-        <script>
-            function filterTable() {
-                const severityFilter = document.getElementById('severityFilter').value;
-                const typeFilter = document.getElementById('typeFilter').value;
-                const searchFilter = document.getElementById('searchFilter').value.toLowerCase();
-
-                const rows = document.querySelectorAll('tbody tr');
-
-                rows.forEach(row => {
-                    const severity = row.getAttribute('data-severity');
-                    const type = row.getAttribute('data-type');
-                    const text = row.textContent.toLowerCase();
-
-                    let showSeverity = true;
-                    if (severityFilter === 'critical') {
-                        showSeverity = severity === 'critical';
-                    } else if (severityFilter === 'high') {
-                        showSeverity = severity === 'critical' || severity === 'high';
-                    } else if (severityFilter === 'medium') {
-                        showSeverity = severity === 'critical' || severity === 'high' || severity === 'medium';
-                    }
-
-                    const showType = typeFilter === 'all' || type === typeFilter;
-                    const showSearch = searchFilter === '' || text.includes(searchFilter);
-
-                    row.style.display = (showSeverity && showType && showSearch) ? '' : 'none';
-                });
-            }
-        </script>
+            </div>
+            <div class="note">
+                <strong>T0 Pollution Warning:</strong> Non-DC servers in T0 infrastructure groups allow T0 admins to sign on, potentially exposing credentials. Review if these servers truly require T0 access.
+            </div>
+        </div>
     </div>
 </body>
 </html>
 "@
 
     $HTML | Out-File -FilePath $FilePath -Encoding UTF8
-    Write-Host "  [+] HTML exported: $FilePath" -ForegroundColor Green
+    Write-Host "[+] HTML Report: $FilePath" -ForegroundColor Green
+
+    return $FilePath
+}
+
+function Export-CSVReports {
+    <#
+    .SYNOPSIS
+        Export CSV reports for each phase
+    #>
+    param(
+        [System.Collections.ArrayList]$ACLResults,
+        [System.Collections.ArrayList]$GapResults,
+        [System.Collections.ArrayList]$AccessMapResults
+    )
+
+    # ACL Report
+    $aclPath = Join-Path $OutputPath "T0_ACL_Trust_Report.csv"
+    $ACLResults | Export-Csv -Path $aclPath -NoTypeInformation -Encoding UTF8
+    Write-Host "[+] ACL Report: $aclPath" -ForegroundColor Green
+
+    # Gap Report
+    $gapPath = Join-Path $OutputPath "T0_Gap_Analysis.csv"
+    $GapResults | Export-Csv -Path $gapPath -NoTypeInformation -Encoding UTF8
+    Write-Host "[+] Gap Analysis: $gapPath" -ForegroundColor Green
+
+    # Access Map
+    $accessPath = Join-Path $OutputPath "T0_Access_Map.csv"
+    $AccessMapResults | Export-Csv -Path $accessPath -NoTypeInformation -Encoding UTF8
+    Write-Host "[+] Access Map: $accessPath" -ForegroundColor Green
+
+    # Discovery Summary
+    $discoveryPath = Join-Path $OutputPath "T0_Discovery_Summary.csv"
+    $discovery = @(
+        [PSCustomObject]@{ Category = "Domain Controllers"; Count = $Script:DomainControllers.Count; Details = ($Script:DomainControllers.Name -join ", ") }
+        [PSCustomObject]@{ Category = "Privileged Users"; Count = $Script:PrivilegedUsers.Count; Details = ($Script:PrivilegedUsers.Name -join ", ") }
+        [PSCustomObject]@{ Category = "T0 Policies"; Count = $Script:T0Policies.Count; Details = ($Script:T0Policies.Name -join ", ") }
+        [PSCustomObject]@{ Category = "T0 Silos"; Count = $Script:T0Silos.Count; Details = ($Script:T0Silos.Name -join ", ") }
+        [PSCustomObject]@{ Category = "T0 Infrastructure Groups"; Count = $Script:T0InfrastructureGroups.Count; Details = ($Script:T0InfrastructureGroups.Name -join ", ") }
+        [PSCustomObject]@{ Category = "T0 Infrastructure Computers"; Count = $Script:T0InfrastructureComputers.Count; Details = ($Script:T0InfrastructureComputers.Name -join ", ") }
+    )
+    $discovery | Export-Csv -Path $discoveryPath -NoTypeInformation -Encoding UTF8
+    Write-Host "[+] Discovery Summary: $discoveryPath" -ForegroundColor Green
 }
 
 #endregion
@@ -1907,107 +1245,61 @@ try {
     # Initialize
     Initialize-AuditEnvironment
 
-    # Run all audits
-    $AllResults = [System.Collections.ArrayList]::new()
+    # Phase 1: Discovery
+    Invoke-Phase1Discovery
 
-    $PolicyACLs = Get-AuthNPolicyACLs
-    foreach ($item in $PolicyACLs) { $null = $AllResults.Add($item) }
-
-    $SiloACLs = Get-AuthNSiloACLs
-    foreach ($item in $SiloACLs) { $null = $AllResults.Add($item) }
-
-    $T0ACLs = Get-T0PolicyAssignmentACLs
-    foreach ($item in $T0ACLs) { $null = $AllResults.Add($item) }
-
-    # Run Gap Analysis if requested
-    $GapAnalysisResults = $null
-    if ($IncludeGapAnalysis) {
-        $GapAnalysisResults = Get-T0CoverageGapAnalysis
+    # Check if we found any T0 policies
+    if ($Script:T0Policies.Count -eq 0 -and $Script:T0Silos.Count -eq 0) {
+        Write-Host ""
+        Write-Host "[!] WARNING: No T0 Authentication Policies or Silos were discovered!" -ForegroundColor Red
+        Write-Host "    This means either:" -ForegroundColor Yellow
+        Write-Host "    1. No privileged users have Authentication Policies assigned" -ForegroundColor Yellow
+        Write-Host "    2. Authentication Policies are not configured in this environment" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "    The audit will continue but Gap Analysis will show all privileged accounts as UNPROTECTED." -ForegroundColor Yellow
+        Write-Host ""
     }
 
-    # Export results
-    Write-Host "`n[*] Exporting results..." -ForegroundColor Cyan
+    # Phase 2: ACL Audit
+    $ACLResults = Invoke-Phase2ACLAudit
 
-    if ($AllResults.Count -gt 0 -or ($GapAnalysisResults -and $GapAnalysisResults.Count -gt 0)) {
-        # Export all results combined
-        Export-ToCSV -Results $AllResults -FileName "T0_AuthN_Security_Audit_All.csv"
-        Export-ToText -Results $AllResults -FileName "T0_AuthN_Security_Audit_All.txt"
-        Export-ToHTML -AllResults $AllResults -FileName "T0_AuthN_Security_Audit_Report.html" -GapAnalysisResults $GapAnalysisResults
+    # Phase 3: Gap Analysis
+    $GapResults = Invoke-Phase3GapAnalysis
 
-        # Export individual reports
-        if ($PolicyACLs.Count -gt 0) {
-            Export-ToCSV -Results ([System.Collections.ArrayList]$PolicyACLs) -FileName "AuthN_Policy_ACLs.csv"
-        }
-        if ($SiloACLs.Count -gt 0) {
-            Export-ToCSV -Results ([System.Collections.ArrayList]$SiloACLs) -FileName "AuthN_Silo_ACLs.csv"
-        }
-        if ($T0ACLs.Count -gt 0) {
-            Export-ToCSV -Results ([System.Collections.ArrayList]$T0ACLs) -FileName "T0_PolicyAssignment_ACLs.csv"
-        }
-        if ($GapAnalysisResults -and $GapAnalysisResults.Count -gt 0) {
-            Export-ToCSV -Results ([System.Collections.ArrayList]$GapAnalysisResults) -FileName "T0_Coverage_Gap_Analysis.csv"
-        }
+    # Phase 4: Access Map
+    $AccessMapResults = Invoke-Phase4AccessMap
 
-        # Summary
-        Write-Host "`n" -NoNewline
-        Write-Host "=" * 70 -ForegroundColor Cyan
-        Write-Host "  Audit Summary" -ForegroundColor Cyan
-        Write-Host "=" * 70 -ForegroundColor Cyan
+    # Phase 5: Reports
+    Write-Host "[Phase 5.1] Exporting CSV Reports..." -ForegroundColor Cyan
+    Export-CSVReports -ACLResults $ACLResults -GapResults $GapResults -AccessMapResults $AccessMapResults
 
-        $CriticalCount = ($AllResults | Where-Object { $_.Severity -eq "Critical" }).Count
-        $HighCount = ($AllResults | Where-Object { $_.Severity -eq "High" }).Count
-        $MediumCount = ($AllResults | Where-Object { $_.Severity -eq "Medium" }).Count
-        $LowCount = ($AllResults | Where-Object { $_.Severity -eq "Low" }).Count
+    Write-Host "[Phase 5.2] Generating HTML Report..." -ForegroundColor Cyan
+    $htmlPath = Export-HTMLReport -ACLResults $ACLResults -GapResults $GapResults -AccessMapResults $AccessMapResults
 
-        Write-Host ""
-        Write-Host "  ACL Audit Findings: $($AllResults.Count)" -ForegroundColor White
-        if ($CriticalCount -gt 0) {
-            Write-Host "    Critical: $CriticalCount" -ForegroundColor Red
-        } else {
-            Write-Host "    Critical: 0" -ForegroundColor Green
-        }
-        if ($HighCount -gt 0) {
-            Write-Host "    High: $HighCount" -ForegroundColor DarkYellow
-        } else {
-            Write-Host "    High: 0" -ForegroundColor Green
-        }
-        Write-Host "    Medium: $MediumCount" -ForegroundColor Yellow
-        Write-Host "    Low: $LowCount" -ForegroundColor Gray
+    # Final Summary
+    Write-Host ""
+    Write-Host "=" * 80 -ForegroundColor Green
+    Write-Host "  AUDIT COMPLETE" -ForegroundColor Green
+    Write-Host "=" * 80 -ForegroundColor Green
+    Write-Host ""
+    Write-Host "  Reports saved to: $OutputPath" -ForegroundColor White
+    Write-Host ""
 
-        # Gap Analysis Summary
-        if ($GapAnalysisResults -and $GapAnalysisResults.Count -gt 0) {
-            $GapCritical = ($GapAnalysisResults | Where-Object { $_.Severity -eq "Critical" }).Count
-            $GapHigh = ($GapAnalysisResults | Where-Object { $_.Severity -eq "High" }).Count
-            $GapMedium = ($GapAnalysisResults | Where-Object { $_.Severity -eq "Medium" }).Count
-            $GapProtected = ($GapAnalysisResults | Where-Object { $_.ProtectionStatus -eq "Protected" }).Count
+    $totalCritical = ($ACLResults | Where-Object { $_.Severity -eq "Critical" }).Count +
+                     ($GapResults | Where-Object { $_.Severity -eq "Critical" }).Count +
+                     ($AccessMapResults | Where-Object { $_.Severity -eq "Critical" }).Count
 
-            Write-Host ""
-            Write-Host "  Gap Analysis (Privileged Accounts):" -ForegroundColor White
-            Write-Host "    Protected: $GapProtected" -ForegroundColor Green
-            if ($GapCritical -gt 0) {
-                Write-Host "    UNPROTECTED Critical: $GapCritical" -ForegroundColor Red
-            }
-            if ($GapHigh -gt 0) {
-                Write-Host "    UNPROTECTED High: $GapHigh" -ForegroundColor DarkYellow
-            }
-            if ($GapMedium -gt 0) {
-                Write-Host "    UNPROTECTED Medium: $GapMedium" -ForegroundColor Yellow
-            }
-        }
-
-        Write-Host ""
-        Write-Host "  Reports saved to: $OutputPath" -ForegroundColor Green
-        Write-Host ""
+    if ($totalCritical -gt 0) {
+        Write-Host "  [!] $totalCritical CRITICAL FINDINGS REQUIRE IMMEDIATE ATTENTION" -ForegroundColor Red
     }
     else {
-        Write-Host "`n[!] No findings to export. This could mean:" -ForegroundColor Yellow
-        Write-Host "    - No Authentication Policies or Silos are configured" -ForegroundColor Yellow
-        Write-Host "    - No T0 accounts match the specified patterns" -ForegroundColor Yellow
-        Write-Host "    - All permissions are inherited (use -IncludeInherited to see them)" -ForegroundColor Yellow
+        Write-Host "  [✓] No critical findings. T0 security posture appears healthy." -ForegroundColor Green
     }
+    Write-Host ""
 }
 catch {
-    Write-Host "`n[ERROR] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "[FATAL ERROR] $($_.Exception.Message)" -ForegroundColor Red
     Write-Host $_.ScriptStackTrace -ForegroundColor Red
     exit 1
 }
