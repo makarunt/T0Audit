@@ -37,9 +37,22 @@
 .PARAMETER T0SearchBase
     Limit T0 account search to a specific OU. Significantly faster in large environments.
 
+.PARAMETER UseAuthNPolicyAssignment
+    RECOMMENDED: Identify T0 objects by checking which accounts have Authentication Policies
+    or Silos assigned. This is the most accurate method as it uses your actual T0 definitions.
+    Detects: msDS-AssignedAuthNPolicy, msDS-AssignedAuthNPolicySilo, and Silo membership.
+
+.PARAMETER IncludePatternMatching
+    When used with -UseAuthNPolicyAssignment, also includes pattern-based detection.
+    Useful for finding T0 assets that should have policies but don't yet.
+
 .EXAMPLE
     .\Invoke-T0AuthNSecurityAudit.ps1
     Basic usage - audits all AuthN Policies, Silos, DCs, and T0 accounts matching default patterns.
+
+.EXAMPLE
+    .\Invoke-T0AuthNSecurityAudit.ps1 -UseAuthNPolicyAssignment
+    RECOMMENDED: Identifies T0 by actual AuthN Policy/Silo assignments (most accurate).
 
 .EXAMPLE
     .\Invoke-T0AuthNSecurityAudit.ps1 -OutputPath "D:\Audits\T0" -IncludeInherited
@@ -104,7 +117,13 @@ param(
     [switch]$SkipT0Computers = $false,
 
     [Parameter(HelpMessage = "Search only in specific OU for T0 accounts")]
-    [string]$T0SearchBase
+    [string]$T0SearchBase,
+
+    [Parameter(HelpMessage = "Use AuthN Policy/Silo assignments to identify T0 (recommended, most accurate)")]
+    [switch]$UseAuthNPolicyAssignment = $false,
+
+    [Parameter(HelpMessage = "Also include pattern matching when using -UseAuthNPolicyAssignment")]
+    [switch]$IncludePatternMatching = $false
 )
 
 #region Configuration
@@ -462,7 +481,7 @@ function Get-T0PolicyAssignmentACLs {
     # Collect T0 objects
     $T0Objects = [System.Collections.ArrayList]::new()
 
-    # Domain Controllers
+    # Domain Controllers (always included)
     Write-Host "  [+] Collecting Domain Controllers..." -ForegroundColor Gray
     try {
         $DCs = Get-ADComputer -Filter { PrimaryGroupID -eq 516 } -Properties DistinguishedName, Name
@@ -479,7 +498,123 @@ function Get-T0PolicyAssignmentACLs {
         Write-Host "    [!] Error collecting Domain Controllers: $_" -ForegroundColor Red
     }
 
-    # T0 User accounts
+    # T0 Detection via AuthN Policy/Silo Assignment (RECOMMENDED - most accurate)
+    if ($UseAuthNPolicyAssignment) {
+        Write-Host "  [+] Collecting T0 objects via AuthN Policy/Silo assignments (recommended method)..." -ForegroundColor Green
+
+        # Method 1: Find all objects with msDS-AssignedAuthNPolicy set
+        Write-Host "    [-] Finding objects with Authentication Policy assigned..." -ForegroundColor Gray
+        try {
+            $PolicyAssignedObjects = Get-ADObject -LDAPFilter "(msDS-AssignedAuthNPolicy=*)" `
+                -Properties Name, DistinguishedName, objectClass, msDS-AssignedAuthNPolicy -ErrorAction SilentlyContinue
+
+            foreach ($obj in $PolicyAssignedObjects) {
+                if ($T0Objects.DN -notcontains $obj.DistinguishedName) {
+                    $objType = switch ($obj.objectClass) {
+                        "user" { "T0 User (Policy Assigned)" }
+                        "computer" { "T0 Computer (Policy Assigned)" }
+                        "msDS-ManagedServiceAccount" { "T0 gMSA (Policy Assigned)" }
+                        "msDS-GroupManagedServiceAccount" { "T0 gMSA (Policy Assigned)" }
+                        default { "T0 Object (Policy Assigned)" }
+                    }
+                    $null = $T0Objects.Add([PSCustomObject]@{
+                        Name = $obj.Name
+                        DN = $obj.DistinguishedName
+                        Type = $objType
+                    })
+                }
+            }
+            $PolicyCount = ($PolicyAssignedObjects | Measure-Object).Count
+            Write-Host "      Found $PolicyCount objects with AuthN Policy assigned" -ForegroundColor Gray
+        }
+        catch {
+            Write-Host "      [!] Error querying policy assignments: $_" -ForegroundColor Red
+        }
+
+        # Method 2: Find all objects with msDS-AssignedAuthNPolicySilo set
+        Write-Host "    [-] Finding objects with Authentication Silo assigned..." -ForegroundColor Gray
+        try {
+            $SiloAssignedObjects = Get-ADObject -LDAPFilter "(msDS-AssignedAuthNPolicySilo=*)" `
+                -Properties Name, DistinguishedName, objectClass, msDS-AssignedAuthNPolicySilo -ErrorAction SilentlyContinue
+
+            foreach ($obj in $SiloAssignedObjects) {
+                if ($T0Objects.DN -notcontains $obj.DistinguishedName) {
+                    $objType = switch ($obj.objectClass) {
+                        "user" { "T0 User (Silo Assigned)" }
+                        "computer" { "T0 Computer (Silo Assigned)" }
+                        "msDS-ManagedServiceAccount" { "T0 gMSA (Silo Assigned)" }
+                        "msDS-GroupManagedServiceAccount" { "T0 gMSA (Silo Assigned)" }
+                        default { "T0 Object (Silo Assigned)" }
+                    }
+                    $null = $T0Objects.Add([PSCustomObject]@{
+                        Name = $obj.Name
+                        DN = $obj.DistinguishedName
+                        Type = $objType
+                    })
+                }
+            }
+            $SiloCount = ($SiloAssignedObjects | Measure-Object).Count
+            Write-Host "      Found $SiloCount objects with AuthN Silo assigned" -ForegroundColor Gray
+        }
+        catch {
+            Write-Host "      [!] Error querying silo assignments: $_" -ForegroundColor Red
+        }
+
+        # Method 3: Get members from Authentication Silos (msDS-AuthNPolicySiloMembers)
+        Write-Host "    [-] Finding members listed in Authentication Silos..." -ForegroundColor Gray
+        try {
+            $ConfigNC = (Get-ADRootDSE).configurationNamingContext
+            $SiloContainer = "CN=AuthN Policy Configuration,CN=Services,$ConfigNC"
+
+            $Silos = Get-ADObject -SearchBase $SiloContainer -Filter { objectClass -eq "msDS-AuthNPolicySilo" } `
+                -Properties Name, "msDS-AuthNPolicySiloMembers" -ErrorAction SilentlyContinue
+
+            $SiloMemberCount = 0
+            foreach ($Silo in $Silos) {
+                $Members = $Silo."msDS-AuthNPolicySiloMembers"
+                if ($Members) {
+                    foreach ($MemberDN in $Members) {
+                        if ($T0Objects.DN -notcontains $MemberDN) {
+                            try {
+                                $MemberObj = Get-ADObject -Identity $MemberDN -Properties Name, objectClass -ErrorAction SilentlyContinue
+                                if ($MemberObj) {
+                                    $objType = switch ($MemberObj.objectClass) {
+                                        "user" { "T0 User (Silo Member: $($Silo.Name))" }
+                                        "computer" { "T0 Computer (Silo Member: $($Silo.Name))" }
+                                        "msDS-ManagedServiceAccount" { "T0 gMSA (Silo Member: $($Silo.Name))" }
+                                        "msDS-GroupManagedServiceAccount" { "T0 gMSA (Silo Member: $($Silo.Name))" }
+                                        default { "T0 Object (Silo Member: $($Silo.Name))" }
+                                    }
+                                    $null = $T0Objects.Add([PSCustomObject]@{
+                                        Name = $MemberObj.Name
+                                        DN = $MemberDN
+                                        Type = $objType
+                                    })
+                                    $SiloMemberCount++
+                                }
+                            }
+                            catch {
+                                # Object may have been deleted
+                            }
+                        }
+                    }
+                }
+            }
+            Write-Host "      Found $SiloMemberCount additional members from Silo membership lists" -ForegroundColor Gray
+        }
+        catch {
+            Write-Host "      [!] Error querying silo members: $_" -ForegroundColor Red
+        }
+
+        # If IncludePatternMatching is not set, skip pattern-based detection
+        if (-not $IncludePatternMatching) {
+            Write-Host "  [+] Skipping pattern-based detection (use -IncludePatternMatching to include)" -ForegroundColor Yellow
+            $SkipT0Users = $true
+            $SkipT0Computers = $true
+        }
+    }
+
+    # T0 User accounts (pattern-based fallback)
     if (-not $SkipT0Users) {
         Write-Host "  [+] Collecting T0 User accounts..." -ForegroundColor Gray
 
