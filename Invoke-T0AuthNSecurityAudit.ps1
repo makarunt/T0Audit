@@ -1293,7 +1293,7 @@ try {
         Write-Host "  [!] $totalCritical CRITICAL FINDINGS REQUIRE IMMEDIATE ATTENTION" -ForegroundColor Red
     }
     else {
-        Write-Host "  [✓] No critical findings. T0 security posture appears healthy." -ForegroundColor Green
+        Write-Host "  [OK] No critical findings. T0 security posture appears healthy." -ForegroundColor Green
     }
     Write-Host ""
 }
