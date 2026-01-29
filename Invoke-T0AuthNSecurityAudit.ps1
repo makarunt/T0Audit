@@ -1024,57 +1024,97 @@ function Export-HTMLReport {
             </ul>
         </div>
 
-        <!-- TABLE 1: ACL Trust Report -->
+        <!-- TABLE 1: ACL Trust Report - Full Details -->
         <div class="section">
             <div class="section-header">
-                <h2>1. ACL Trust Report - Unauthorized Managers</h2>
-                <span class="badge $(if ($ACLCritical -gt 0) { 'critical' } else { 'healthy' })">$ACLCritical Critical</span>
+                <h2>1. ACL Trust Report - All Permissions on T0 Security Objects</h2>
+                <span class="badge $(if ($ACLCritical -gt 0) { 'critical' } else { 'healthy' })">$($ACLResults.Count) Total, $ACLCritical Critical</span>
             </div>
             <div class="table-container">
 "@
 
-    # Filter to show only Critical and Medium (hide Healthy/Info in main view)
-    $criticalACLs = $ACLResults | Where-Object { $_.Severity -eq "Critical" }
+    # Show ALL ACLs grouped by object, with color coding
+    if ($ACLResults.Count -gt 0) {
+        # Group by object for better readability
+        $groupedACLs = $ACLResults | Group-Object -Property ObjectName
 
-    if ($criticalACLs.Count -gt 0) {
-        $HTML += @"
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Severity</th>
-                            <th>Object</th>
-                            <th>Type</th>
-                            <th>Unauthorized Identity</th>
-                            <th>Rights</th>
-                            <th>Risk</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-"@
-        foreach ($acl in $criticalACLs) {
+        foreach ($objectGroup in $groupedACLs) {
+            $objectName = $objectGroup.Name
+            $objectType = $objectGroup.Group[0].ObjectType
+            $objectCriticalCount = ($objectGroup.Group | Where-Object { $_.Severity -eq "Critical" }).Count
+
+            $objectHeaderClass = if ($objectCriticalCount -gt 0) { "background: #f8d7da;" } else { "background: #e7f3ff;" }
+
             $HTML += @"
-                        <tr class="row-critical">
-                            <td><span class="severity-badge severity-critical">CRITICAL</span></td>
-                            <td><strong>$($acl.ObjectName)</strong></td>
-                            <td>$($acl.ObjectType)</td>
-                            <td>$($acl.IdentityReference)</td>
-                            <td>$($acl.Rights)</td>
-                            <td>$($acl.Reason)</td>
-                        </tr>
+                <div style="margin: 15px 0; border: 1px solid #dee2e6; border-radius: 8px; overflow: hidden;">
+                    <div style="$objectHeaderClass padding: 10px 15px; font-weight: bold; border-bottom: 1px solid #dee2e6;">
+                        $objectType: $objectName
+                        $(if ($objectCriticalCount -gt 0) { "<span class='severity-badge severity-critical' style='margin-left: 10px;'>$objectCriticalCount CRITICAL</span>" })
+                    </div>
+                    <table style="margin: 0;">
+                        <thead>
+                            <tr>
+                                <th style="width: 100px;">Severity</th>
+                                <th>Identity</th>
+                                <th>Rights</th>
+                                <th>Type</th>
+                                <th>Inherited</th>
+                                <th>Classification</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+"@
+            # Sort by severity (Critical first, then others)
+            $sortedACLs = $objectGroup.Group | Sort-Object @{Expression={
+                switch ($_.Severity) { "Critical" { 0 } "Medium" { 1 } "Healthy" { 2 } "Info" { 3 } default { 4 } }
+            }}
+
+            foreach ($acl in $sortedACLs) {
+                $rowClass = switch ($acl.Severity) {
+                    "Critical" { "row-critical" }
+                    "Medium" { "row-warning" }
+                    default { "" }
+                }
+                $severityClass = switch ($acl.Severity) {
+                    "Critical" { "severity-critical" }
+                    "Medium" { "severity-warning" }
+                    "Healthy" { "severity-healthy" }
+                    "Info" { "severity-info" }
+                    default { "severity-info" }
+                }
+                $severityText = $acl.Severity.ToUpper()
+
+                $HTML += @"
+                            <tr class="$rowClass">
+                                <td><span class="severity-badge $severityClass">$severityText</span></td>
+                                <td>$($acl.IdentityReference)</td>
+                                <td><code style="font-size: 0.85em;">$($acl.Rights)</code></td>
+                                <td>$($acl.AccessControlType)</td>
+                                <td>$(if ($acl.IsInherited) { 'Yes' } else { 'No' })</td>
+                                <td>$($acl.Reason)</td>
+                            </tr>
+"@
+            }
+
+            $HTML += @"
+                        </tbody>
+                    </table>
+                </div>
 "@
         }
-        $HTML += "</tbody></table>"
     }
     else {
-        $HTML += '<div class="no-findings"><div class="icon">✓</div>No unauthorized managers found. All T0 security objects have expected permissions.</div>'
+        $HTML += '<div class="no-findings"><div class="icon">!</div>No T0 Authentication Policies or Silos were discovered. ACL audit could not be performed.</div>'
     }
 
-    # Add note about expected permissions
-    $healthyACLs = $ACLResults | Where-Object { $_.Severity -eq "Healthy" -or $_.Severity -eq "Info" }
     $HTML += @"
             </div>
             <div class="note info">
-                <strong>Note:</strong> $($healthyACLs.Count) expected permissions (SYSTEM, Domain Admins, Enterprise Admins) are not shown. These are required for normal AD operations.
+                <strong>Severity Legend:</strong><br>
+                <span class="severity-badge severity-critical">CRITICAL</span> Unauthorized identity with modify rights - privilege escalation path<br>
+                <span class="severity-badge severity-warning">MEDIUM</span> Non-standard permission - review recommended<br>
+                <span class="severity-badge severity-healthy">HEALTHY</span> Expected permission (Domain Admins, Enterprise Admins)<br>
+                <span class="severity-badge severity-info">INFO</span> System/read-only permission - required for AD operations
             </div>
         </div>
 
