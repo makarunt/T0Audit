@@ -22,11 +22,40 @@
 .PARAMETER IncludeInherited
     Include inherited permissions in the report. Default: $false
 
-.EXAMPLE
-    .\Invoke-T0AuthNSecurityAudit.ps1
+.PARAMETER T0UserGroupDN
+    DN of a group containing T0 users. Using group membership is MUCH faster than pattern matching.
+
+.PARAMETER T0ComputerGroupDN
+    DN of a group containing T0 computers. Using group membership is MUCH faster than pattern matching.
+
+.PARAMETER SkipT0Users
+    Skip T0 user account scanning. Useful when you only need to audit DCs and infrastructure.
+
+.PARAMETER SkipT0Computers
+    Skip T0 computer account scanning. Domain Controllers are always included.
+
+.PARAMETER T0SearchBase
+    Limit T0 account search to a specific OU. Significantly faster in large environments.
 
 .EXAMPLE
-    .\Invoke-T0AuthNSecurityAudit.ps1 -OutputPath "D:\Audits\T0" -IncludeInherited $true
+    .\Invoke-T0AuthNSecurityAudit.ps1
+    Basic usage - audits all AuthN Policies, Silos, DCs, and T0 accounts matching default patterns.
+
+.EXAMPLE
+    .\Invoke-T0AuthNSecurityAudit.ps1 -OutputPath "D:\Audits\T0" -IncludeInherited
+    Custom output path and include inherited permissions.
+
+.EXAMPLE
+    .\Invoke-T0AuthNSecurityAudit.ps1 -T0UserGroupDN "CN=Tier0-Users,OU=Groups,DC=contoso,DC=com"
+    Use group membership for T0 users (much faster than pattern matching).
+
+.EXAMPLE
+    .\Invoke-T0AuthNSecurityAudit.ps1 -SkipT0Users -SkipT0Computers
+    Only audit AuthN Policies, Silos, and Domain Controllers (fastest option).
+
+.EXAMPLE
+    .\Invoke-T0AuthNSecurityAudit.ps1 -T0SearchBase "OU=Tier0,DC=contoso,DC=com"
+    Limit T0 account search to a specific OU.
 
 .NOTES
     Author: T0 Security Team
@@ -60,7 +89,22 @@ param(
     [string[]]$T0UserPatterns = @("*-T0", "*-adm", "*-admin", "T0-*", "Admin-*"),
 
     [Parameter()]
-    [string[]]$T0ComputerPatterns = @("*PKI*", "*ADFS*", "*AADConnect*", "*AADC*", "*CA*", "*CertAuth*", "*EntraConnect*")
+    [string[]]$T0ComputerPatterns = @("*PKI*", "*ADFS*", "*AADConnect*", "*AADC*", "*CA*", "*CertAuth*", "*EntraConnect*"),
+
+    [Parameter(HelpMessage = "DN of group containing T0 users (faster than pattern matching)")]
+    [string]$T0UserGroupDN,
+
+    [Parameter(HelpMessage = "DN of group containing T0 computers (faster than pattern matching)")]
+    [string]$T0ComputerGroupDN,
+
+    [Parameter(HelpMessage = "Skip T0 user account scanning")]
+    [switch]$SkipT0Users = $false,
+
+    [Parameter(HelpMessage = "Skip T0 computer account scanning (DCs are always included)")]
+    [switch]$SkipT0Computers = $false,
+
+    [Parameter(HelpMessage = "Search only in specific OU for T0 accounts")]
+    [string]$T0SearchBase
 )
 
 #region Configuration
@@ -436,44 +480,141 @@ function Get-T0PolicyAssignmentACLs {
     }
 
     # T0 User accounts
-    Write-Host "  [+] Collecting T0 User accounts..." -ForegroundColor Gray
-    foreach ($pattern in $T0UserPatterns) {
-        try {
-            $Users = Get-ADUser -Filter "Name -like '$pattern'" -Properties DistinguishedName, Name -ErrorAction SilentlyContinue
-            foreach ($User in $Users) {
-                # Avoid duplicates
-                if ($T0Objects.DN -notcontains $User.DistinguishedName) {
-                    $null = $T0Objects.Add([PSCustomObject]@{
-                        Name = $User.Name
-                        DN = $User.DistinguishedName
-                        Type = "T0 User"
-                    })
+    if (-not $SkipT0Users) {
+        Write-Host "  [+] Collecting T0 User accounts..." -ForegroundColor Gray
+
+        if ($T0UserGroupDN) {
+            # Fast path: Get users from group membership
+            Write-Host "    Using group membership: $T0UserGroupDN" -ForegroundColor Gray
+            try {
+                $Users = Get-ADGroupMember -Identity $T0UserGroupDN -Recursive |
+                    Where-Object { $_.objectClass -eq "user" } |
+                    Get-ADUser -Properties DistinguishedName, Name -ErrorAction SilentlyContinue
+                foreach ($User in $Users) {
+                    if ($T0Objects.DN -notcontains $User.DistinguishedName) {
+                        $null = $T0Objects.Add([PSCustomObject]@{
+                            Name = $User.Name
+                            DN = $User.DistinguishedName
+                            Type = "T0 User"
+                        })
+                    }
                 }
+                Write-Host "    Found $($Users.Count) T0 Users from group" -ForegroundColor Gray
+            }
+            catch {
+                Write-Host "    [!] Error getting group members: $_" -ForegroundColor Red
             }
         }
-        catch {
-            # Silently continue
+        else {
+            # Build combined LDAP filter for all patterns (single query instead of multiple)
+            $LdapFilterParts = $T0UserPatterns | ForEach-Object { "(name=$_)" }
+            $CombinedLdapFilter = "(|$($LdapFilterParts -join ''))"
+
+            Write-Host "    Using LDAP filter: $CombinedLdapFilter" -ForegroundColor Gray
+            Write-Host "    Note: Wildcard searches can be slow in large directories." -ForegroundColor Yellow
+            Write-Host "    Tip: Use -T0UserGroupDN for faster results or -SkipT0Users to skip." -ForegroundColor Yellow
+
+            $SearchParams = @{
+                LDAPFilter = $CombinedLdapFilter
+                Properties = @("DistinguishedName", "Name")
+                ErrorAction = "SilentlyContinue"
+            }
+            if ($T0SearchBase) {
+                $SearchParams.SearchBase = $T0SearchBase
+                Write-Host "    Searching in: $T0SearchBase" -ForegroundColor Gray
+            }
+
+            try {
+                $Users = Get-ADUser @SearchParams
+                $UserCount = 0
+                foreach ($User in $Users) {
+                    if ($T0Objects.DN -notcontains $User.DistinguishedName) {
+                        $null = $T0Objects.Add([PSCustomObject]@{
+                            Name = $User.Name
+                            DN = $User.DistinguishedName
+                            Type = "T0 User"
+                        })
+                        $UserCount++
+                    }
+                }
+                Write-Host "    Found $UserCount T0 Users" -ForegroundColor Gray
+            }
+            catch {
+                Write-Host "    [!] Error collecting T0 users: $_" -ForegroundColor Red
+            }
         }
+    }
+    else {
+        Write-Host "  [+] Skipping T0 User account collection (-SkipT0Users)" -ForegroundColor Yellow
     }
 
     # T0 Computer accounts
-    Write-Host "  [+] Collecting T0 Computer accounts..." -ForegroundColor Gray
-    foreach ($pattern in $T0ComputerPatterns) {
-        try {
-            $Computers = Get-ADComputer -Filter "Name -like '$pattern'" -Properties DistinguishedName, Name -ErrorAction SilentlyContinue
-            foreach ($Computer in $Computers) {
-                if ($T0Objects.DN -notcontains $Computer.DistinguishedName) {
-                    $null = $T0Objects.Add([PSCustomObject]@{
-                        Name = $Computer.Name
-                        DN = $Computer.DistinguishedName
-                        Type = "T0 Computer"
-                    })
+    if (-not $SkipT0Computers) {
+        Write-Host "  [+] Collecting T0 Computer accounts..." -ForegroundColor Gray
+
+        if ($T0ComputerGroupDN) {
+            # Fast path: Get computers from group membership
+            Write-Host "    Using group membership: $T0ComputerGroupDN" -ForegroundColor Gray
+            try {
+                $Computers = Get-ADGroupMember -Identity $T0ComputerGroupDN -Recursive |
+                    Where-Object { $_.objectClass -eq "computer" } |
+                    Get-ADComputer -Properties DistinguishedName, Name -ErrorAction SilentlyContinue
+                foreach ($Computer in $Computers) {
+                    if ($T0Objects.DN -notcontains $Computer.DistinguishedName) {
+                        $null = $T0Objects.Add([PSCustomObject]@{
+                            Name = $Computer.Name
+                            DN = $Computer.DistinguishedName
+                            Type = "T0 Computer"
+                        })
+                    }
                 }
+                Write-Host "    Found $($Computers.Count) T0 Computers from group" -ForegroundColor Gray
+            }
+            catch {
+                Write-Host "    [!] Error getting group members: $_" -ForegroundColor Red
             }
         }
-        catch {
-            # Silently continue
+        else {
+            # Build combined LDAP filter for all patterns (single query)
+            $LdapFilterParts = $T0ComputerPatterns | ForEach-Object { "(name=$_)" }
+            $CombinedLdapFilter = "(|$($LdapFilterParts -join ''))"
+
+            Write-Host "    Using LDAP filter: $CombinedLdapFilter" -ForegroundColor Gray
+            Write-Host "    Note: Wildcard searches can be slow in large directories." -ForegroundColor Yellow
+            Write-Host "    Tip: Use -T0ComputerGroupDN for faster results or -SkipT0Computers to skip." -ForegroundColor Yellow
+
+            $SearchParams = @{
+                LDAPFilter = $CombinedLdapFilter
+                Properties = @("DistinguishedName", "Name")
+                ErrorAction = "SilentlyContinue"
+            }
+            if ($T0SearchBase) {
+                $SearchParams.SearchBase = $T0SearchBase
+                Write-Host "    Searching in: $T0SearchBase" -ForegroundColor Gray
+            }
+
+            try {
+                $Computers = Get-ADComputer @SearchParams
+                $ComputerCount = 0
+                foreach ($Computer in $Computers) {
+                    if ($T0Objects.DN -notcontains $Computer.DistinguishedName) {
+                        $null = $T0Objects.Add([PSCustomObject]@{
+                            Name = $Computer.Name
+                            DN = $Computer.DistinguishedName
+                            Type = "T0 Computer"
+                        })
+                        $ComputerCount++
+                    }
+                }
+                Write-Host "    Found $ComputerCount T0 Computers" -ForegroundColor Gray
+            }
+            catch {
+                Write-Host "    [!] Error collecting T0 computers: $_" -ForegroundColor Red
+            }
         }
+    }
+    else {
+        Write-Host "  [+] Skipping T0 Computer account collection (-SkipT0Computers)" -ForegroundColor Yellow
     }
 
     # Read-Only Domain Controllers
@@ -496,9 +637,19 @@ function Get-T0PolicyAssignmentACLs {
 
     Write-Host "  [+] Total T0 objects to audit: $($T0Objects.Count)" -ForegroundColor Green
 
-    # Check each T0 object
+    # Check each T0 object with progress
+    $TotalObjects = $T0Objects.Count
+    $CurrentObject = 0
+    $ProgressInterval = [Math]::Max(1, [Math]::Floor($TotalObjects / 20)) # Update progress every 5%
+
     foreach ($T0Object in $T0Objects) {
-        Write-Host "    [-] Checking: $($T0Object.Name) ($($T0Object.Type))" -ForegroundColor Gray
+        $CurrentObject++
+
+        # Show progress periodically to avoid console spam
+        if ($CurrentObject % $ProgressInterval -eq 0 -or $CurrentObject -eq $TotalObjects) {
+            $PercentComplete = [Math]::Round(($CurrentObject / $TotalObjects) * 100)
+            Write-Host "    [Progress] $CurrentObject / $TotalObjects ($PercentComplete%) - Current: $($T0Object.Name)" -ForegroundColor Gray
+        }
 
         try {
             $ACL = Get-Acl "AD:\$($T0Object.DN)"
