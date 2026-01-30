@@ -7,7 +7,13 @@ param(
     [switch]$IncludeInherited = $false,
 
     [Parameter(HelpMessage = "Additional privileged groups to include (array of group names)")]
-    [string[]]$AdditionalPrivilegedGroups = @()
+    [string[]]$AdditionalPrivilegedGroups = @(),
+
+    [Parameter(HelpMessage = "Explicitly specify T0 Infrastructure Group name(s) - bypasses SDDL parsing")]
+    [string[]]$T0InfrastructureGroupName = @(),
+
+    [Parameter(HelpMessage = "Domain where the T0 Infrastructure Group resides (default: current domain)")]
+    [string]$T0InfrastructureGroupDomain = ""
 )
 
 <#
@@ -48,9 +54,26 @@ param(
 .PARAMETER AdditionalPrivilegedGroups
     Additional privileged groups to include in the audit.
 
+.PARAMETER T0InfrastructureGroupName
+    Explicitly specify the T0 Infrastructure Group name(s). This bypasses SDDL parsing
+    and directly uses the specified group(s) to determine where T0 admins can sign on.
+    RECOMMENDED for reliable results. Example: "Tier 0 Servers"
+
+.PARAMETER T0InfrastructureGroupDomain
+    Domain where the T0 Infrastructure Group resides. Use this when the group is in
+    a different domain than where you're running the script. Example: "corp.pri"
+
 .EXAMPLE
     .\Invoke-T0AuthNSecurityAudit.ps1
-    Run full T0 security audit with default settings.
+    Run full T0 security audit with default settings (tries SDDL auto-discovery).
+
+.EXAMPLE
+    .\Invoke-T0AuthNSecurityAudit.ps1 -T0InfrastructureGroupName "Tier 0 Servers"
+    Run audit with explicitly specified T0 Infrastructure Group (RECOMMENDED).
+
+.EXAMPLE
+    .\Invoke-T0AuthNSecurityAudit.ps1 -T0InfrastructureGroupName "Tier 0 Servers" -T0InfrastructureGroupDomain "corp.pri"
+    Run audit when T0 group is in a different domain than where you're running.
 
 .EXAMPLE
     .\Invoke-T0AuthNSecurityAudit.ps1 -OutputPath "D:\Audits"
@@ -62,13 +85,16 @@ param(
 
 .NOTES
     Author: T0 Security Team
-    Version: 2.0
+    Version: 2.1
     Requires: ActiveDirectory module, AD: PSDrive access
 
     Severity Classification:
     - CRITICAL: Unauthorized identity with modify rights on T0 objects
     - WARNING: T0 Pollution (non-DC in T0 server group)
     - INFO: Expected permissions (SYSTEM, Domain Admins, Enterprise Admins)
+
+    IMPORTANT: If the "Effective Perimeter Map" shows all DCs as "NONE - Not in any T0 Group",
+    use the -T0InfrastructureGroupName parameter to explicitly specify your T0 group.
 #>
 
 #region Script Variables
@@ -590,42 +616,106 @@ function Invoke-Phase1Discovery {
     Write-Host "    Found $($Script:T0Silos.Count) T0 Authentication Silos" -ForegroundColor Green
     Write-Host "    Found $($Script:T0Policies.Count) T0 Authentication Policies (including silo-linked)" -ForegroundColor Green
 
-    # Step 1.4: Extract Infrastructure Groups from Policies
-    Write-Host "[Phase 1.4] Extracting T0 Infrastructure Groups from Policies..." -ForegroundColor Cyan
+    # Step 1.4: Extract Infrastructure Groups from Policies (or use explicit parameter)
+    Write-Host "[Phase 1.4] Identifying T0 Infrastructure Groups..." -ForegroundColor Cyan
 
-    foreach ($policy in $Script:T0Policies) {
-        $userAllowedFrom = $policy.UserAllowedToAuthenticateFrom
+    # Method 1: Use explicitly provided T0 Infrastructure Group names (RECOMMENDED)
+    if ($T0InfrastructureGroupName.Count -gt 0) {
+        Write-Host "    Using explicitly provided T0 Infrastructure Group(s): $($T0InfrastructureGroupName -join ', ')" -ForegroundColor Green
 
-        if (-not [string]::IsNullOrEmpty($userAllowedFrom)) {
-            Write-Host "    Policy '$($policy.Name)' has User Sign-On restriction" -ForegroundColor Gray
+        # Determine which domain to query
+        $groupQueryServer = $null
+        if (-not [string]::IsNullOrEmpty($T0InfrastructureGroupDomain)) {
+            try {
+                $domainContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $T0InfrastructureGroupDomain)
+                $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($domainContext)
+                $groupQueryServer = $domain.FindDomainController().Name
+                Write-Host "    Querying domain: $T0InfrastructureGroupDomain (DC: $groupQueryServer)" -ForegroundColor Gray
+            }
+            catch {
+                Write-Host "    [!] Could not connect to domain $T0InfrastructureGroupDomain, using current domain" -ForegroundColor Yellow
+            }
+        }
 
-            # Extract groups from the SDDL condition
-            $groups = Get-GroupFromSDDL -SDDLCondition $userAllowedFrom
+        foreach ($groupName in $T0InfrastructureGroupName) {
+            try {
+                $getParams = @{
+                    Identity = $groupName
+                    Properties = @("Name", "DistinguishedName", "objectSid")
+                    ErrorAction = "Stop"
+                }
+                if ($groupQueryServer) {
+                    $getParams["Server"] = $groupQueryServer
+                }
 
-            foreach ($group in $groups) {
-                # Check if this is a group (not a built-in SID)
-                if ($group.SID -notmatch "^S-1-5-[0-9]+$" -and $group.SID -notmatch "^S-1-1-0$") {
-                    try {
-                        # Try to get as AD group
-                        $adGroup = Get-ADGroup -Identity $group.SID -Properties Members -ErrorAction SilentlyContinue
-                        if ($adGroup) {
-                            $null = $Script:T0InfrastructureGroups.Add([PSCustomObject]@{
-                                Name = $adGroup.Name
-                                DN = $adGroup.DistinguishedName
-                                SID = $group.SID
-                                SourcePolicy = $policy.Name
-                            })
-                            Write-Host "      Found infrastructure group: $($adGroup.Name)" -ForegroundColor Green
+                $adGroup = Get-ADGroup @getParams
+                $null = $Script:T0InfrastructureGroups.Add([PSCustomObject]@{
+                    Name = $adGroup.Name
+                    DN = $adGroup.DistinguishedName
+                    SID = $adGroup.objectSid.Value
+                    SourcePolicy = "Explicitly Specified"
+                })
+                Write-Host "      [OK] Found T0 Infrastructure Group: $($adGroup.Name)" -ForegroundColor Green
+                Write-Host "          DN: $($adGroup.DistinguishedName)" -ForegroundColor Gray
+            }
+            catch {
+                Write-Host "      [!] Could not find group: $groupName - $_" -ForegroundColor Red
+            }
+        }
+    }
+    # Method 2: Try to extract from Policy SDDL (automatic discovery)
+    else {
+        Write-Host "    Attempting to extract groups from Policy SDDL..." -ForegroundColor Gray
+
+        foreach ($policy in $Script:T0Policies) {
+            $userAllowedFrom = $policy.UserAllowedToAuthenticateFrom
+
+            if (-not [string]::IsNullOrEmpty($userAllowedFrom)) {
+                Write-Host "    Policy '$($policy.Name)' has User Sign-On restriction" -ForegroundColor Gray
+                Write-Host "      SDDL: $userAllowedFrom" -ForegroundColor DarkGray
+
+                # Extract groups from the SDDL condition
+                $groups = Get-GroupFromSDDL -SDDLCondition $userAllowedFrom
+
+                foreach ($group in $groups) {
+                    # Check if this is a group (not a built-in SID)
+                    if ($group.SID -notmatch "^S-1-5-[0-9]+$" -and $group.SID -notmatch "^S-1-1-0$") {
+                        try {
+                            # Try to get as AD group
+                            $adGroup = Get-ADGroup -Identity $group.SID -Properties Members -ErrorAction SilentlyContinue
+                            if ($adGroup) {
+                                $null = $Script:T0InfrastructureGroups.Add([PSCustomObject]@{
+                                    Name = $adGroup.Name
+                                    DN = $adGroup.DistinguishedName
+                                    SID = $group.SID
+                                    SourcePolicy = $policy.Name
+                                })
+                                Write-Host "      Found infrastructure group: $($adGroup.Name)" -ForegroundColor Green
+                            }
                         }
-                    }
-                    catch {
-                        # Not a group or can't be resolved
+                        catch {
+                            # Not a group or can't be resolved
+                        }
                     }
                 }
             }
         }
+
+        # If SDDL parsing failed, provide guidance
+        if ($Script:T0InfrastructureGroups.Count -eq 0 -and $Script:T0Policies.Count -gt 0) {
+            Write-Host ""
+            Write-Host "    [!] WARNING: Could not extract T0 Infrastructure Groups from SDDL" -ForegroundColor Yellow
+            Write-Host "    [!] This is common when the restriction is configured via Silo or in a different format." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "    [TIP] Re-run the script with explicit group name:" -ForegroundColor Cyan
+            Write-Host '         .\Invoke-T0AuthNSecurityAudit.ps1 -T0InfrastructureGroupName "Tier 0 Servers"' -ForegroundColor White
+            Write-Host ""
+            Write-Host "    [TIP] If the group is in a different domain:" -ForegroundColor Cyan
+            Write-Host '         .\Invoke-T0AuthNSecurityAudit.ps1 -T0InfrastructureGroupName "Tier 0 Servers" -T0InfrastructureGroupDomain "corp.pri"' -ForegroundColor White
+            Write-Host ""
+        }
     }
-    Write-Host "    Found $($Script:T0InfrastructureGroups.Count) T0 Infrastructure Groups" -ForegroundColor Green
+    Write-Host "    Found $($Script:T0InfrastructureGroups.Count) T0 Infrastructure Groups" -ForegroundColor $(if ($Script:T0InfrastructureGroups.Count -gt 0) { "Green" } else { "Yellow" })
 
     # Step 1.5: Get all computers in T0 Infrastructure Groups (with nested group resolution)
     Write-Host "[Phase 1.5] Mapping T0 Infrastructure Computers (resolving nested groups)..." -ForegroundColor Cyan
