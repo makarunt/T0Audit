@@ -529,19 +529,30 @@ function Invoke-Phase1Discovery {
     }
 
     # Get full details for discovered policies
+    # Note: Auth Policies are in Configuration partition - use regular LDAP (not GC) to get all attributes
+    # GC (port 3268) doesn't contain all attributes like msDS-UserAllowedToAuthenticateFrom
     foreach ($policyDN in $discoveredPolicies.Keys) {
         try {
-            $policy = Get-ADObject -Identity $policyDN `
+            # Query directly by DN - any DC can read Configuration partition
+            $policy = Get-ADObject -Identity $policyDN -Server $Script:GlobalCatalogServer `
                 -Properties Name, DistinguishedName, Description, `
                             "msDS-UserAllowedToAuthenticateFrom", "msDS-UserAllowedToAuthenticateTo", `
                             "msDS-UserTGTLifetime", "msDS-ComputerAllowedToAuthenticateTo", `
                             "msDS-ServiceAllowedToAuthenticateFrom", "msDS-ServiceAllowedToAuthenticateTo"
 
+            $userAllowedFrom = $policy."msDS-UserAllowedToAuthenticateFrom"
+            Write-Host "      Policy: $($policy.Name)" -ForegroundColor Gray
+            if (-not [string]::IsNullOrEmpty($userAllowedFrom)) {
+                Write-Host "        UserAllowedToAuthenticateFrom: $userAllowedFrom" -ForegroundColor DarkGray
+            } else {
+                Write-Host "        UserAllowedToAuthenticateFrom: (not set)" -ForegroundColor DarkGray
+            }
+
             $null = $Script:T0Policies.Add([PSCustomObject]@{
                 Name = $policy.Name
                 DN = $policy.DistinguishedName
                 Description = $policy.Description
-                UserAllowedToAuthenticateFrom = $policy."msDS-UserAllowedToAuthenticateFrom"
+                UserAllowedToAuthenticateFrom = $userAllowedFrom
                 UserAllowedToAuthenticateTo = $policy."msDS-UserAllowedToAuthenticateTo"
                 UserTGTLifetime = $policy."msDS-UserTGTLifetime"
                 AssignedUsers = $discoveredPolicies[$policyDN]
@@ -549,7 +560,7 @@ function Invoke-Phase1Discovery {
             })
         }
         catch {
-            Write-Host "      [!] Could not read policy: $policyDN" -ForegroundColor Yellow
+            Write-Host "      [!] Could not read policy: $policyDN - $_" -ForegroundColor Yellow
         }
     }
     Write-Host "    Found $($Script:T0Policies.Count) T0 Authentication Policies" -ForegroundColor Green
@@ -557,10 +568,21 @@ function Invoke-Phase1Discovery {
     # Get full details for discovered silos
     foreach ($siloDN in $discoveredSilos.Keys) {
         try {
-            $silo = Get-ADObject -Identity $siloDN `
+            # Query Silo using regular LDAP (not GC) to get all attributes
+            # GC port 3268 doesn't contain all attributes like msDS-UserAllowedToAuthenticateFrom
+            $silo = Get-ADObject -Identity $siloDN -Server $Script:GlobalCatalogServer `
                 -Properties Name, DistinguishedName, Description, `
                             "msDS-AuthNPolicySiloMembers", "msDS-AuthNPolicySiloEnforced", `
-                            "msDS-ComputerAuthNPolicy", "msDS-ServiceAuthNPolicy", "msDS-UserAuthNPolicy"
+                            "msDS-ComputerAuthNPolicy", "msDS-ServiceAuthNPolicy", "msDS-UserAuthNPolicy", `
+                            "msDS-UserAllowedToAuthenticateFrom"
+
+            Write-Host "      Silo: $($silo.Name)" -ForegroundColor Gray
+
+            # Check if Silo has UserAllowedToAuthenticateFrom directly
+            $siloUserAllowedFrom = $silo."msDS-UserAllowedToAuthenticateFrom"
+            if (-not [string]::IsNullOrEmpty($siloUserAllowedFrom)) {
+                Write-Host "        Silo UserAllowedToAuthenticateFrom: $siloUserAllowedFrom" -ForegroundColor DarkGray
+            }
 
             $null = $Script:T0Silos.Add([PSCustomObject]@{
                 Name = $silo.Name
@@ -571,6 +593,7 @@ function Invoke-Phase1Discovery {
                 ComputerPolicy = $silo."msDS-ComputerAuthNPolicy"
                 ServicePolicy = $silo."msDS-ServiceAuthNPolicy"
                 UserPolicy = $silo."msDS-UserAuthNPolicy"
+                UserAllowedToAuthenticateFrom = $siloUserAllowedFrom
                 AssignedUsers = $discoveredSilos[$siloDN]
                 DiscoverySource = "Privileged User Assignment"
             })
@@ -585,43 +608,120 @@ function Invoke-Phase1Discovery {
                 $existingPolicy = $Script:T0Policies | Where-Object { $_.DN -eq $policyDN }
                 if (-not $existingPolicy) {
                     try {
-                        $policy = Get-ADObject -Identity $policyDN `
+                        # Query policy using regular LDAP to get all attributes
+                        $policy = Get-ADObject -Identity $policyDN -Server $Script:GlobalCatalogServer `
                             -Properties Name, DistinguishedName, Description, `
                                         "msDS-UserAllowedToAuthenticateFrom", "msDS-UserAllowedToAuthenticateTo", `
                                         "msDS-UserTGTLifetime", "msDS-ComputerAllowedToAuthenticateTo", `
                                         "msDS-ServiceAllowedToAuthenticateFrom", "msDS-ServiceAllowedToAuthenticateTo"
 
+                        $userAllowedFrom = $policy."msDS-UserAllowedToAuthenticateFrom"
+                        Write-Host "        Linked Policy: $($policy.Name)" -ForegroundColor Gray
+                        if (-not [string]::IsNullOrEmpty($userAllowedFrom)) {
+                            Write-Host "          UserAllowedToAuthenticateFrom: $userAllowedFrom" -ForegroundColor DarkGray
+                        } else {
+                            Write-Host "          UserAllowedToAuthenticateFrom: (not set)" -ForegroundColor DarkGray
+                        }
+
                         $null = $Script:T0Policies.Add([PSCustomObject]@{
                             Name = $policy.Name
                             DN = $policy.DistinguishedName
                             Description = $policy.Description
-                            UserAllowedToAuthenticateFrom = $policy."msDS-UserAllowedToAuthenticateFrom"
+                            UserAllowedToAuthenticateFrom = $userAllowedFrom
                             UserAllowedToAuthenticateTo = $policy."msDS-UserAllowedToAuthenticateTo"
                             UserTGTLifetime = $policy."msDS-UserTGTLifetime"
                             AssignedUsers = @()
                             DiscoverySource = "Linked to Silo: $($silo.Name)"
                         })
-                        Write-Host "      Discovered policy from silo: $($policy.Name)" -ForegroundColor Green
                     }
                     catch {
-                        Write-Host "      [!] Could not read policy linked to silo: $policyDN" -ForegroundColor Yellow
+                        Write-Host "      [!] Could not read policy linked to silo: $policyDN - $_" -ForegroundColor Yellow
                     }
                 }
             }
         }
         catch {
-            Write-Host "      [!] Could not read silo: $siloDN" -ForegroundColor Yellow
+            Write-Host "      [!] Could not read silo: $siloDN - $_" -ForegroundColor Yellow
         }
     }
     Write-Host "    Found $($Script:T0Silos.Count) T0 Authentication Silos" -ForegroundColor Green
     Write-Host "    Found $($Script:T0Policies.Count) T0 Authentication Policies (including silo-linked)" -ForegroundColor Green
 
-    # Step 1.4: Extract Infrastructure Groups from Policies (or use explicit parameter)
+    # Step 1.4: Extract Infrastructure Groups from Policies and Silos (automatic discovery)
     Write-Host "[Phase 1.4] Identifying T0 Infrastructure Groups..." -ForegroundColor Cyan
 
-    # Method 1: Use explicitly provided T0 Infrastructure Group names (RECOMMENDED)
-    if ($T0InfrastructureGroupName.Count -gt 0) {
-        Write-Host "    Using explicitly provided T0 Infrastructure Group(s): $($T0InfrastructureGroupName -join ', ')" -ForegroundColor Green
+    # Helper function to extract and add groups from SDDL
+    function Add-GroupsFromSDDL {
+        param(
+            [string]$SDDLCondition,
+            [string]$SourceName,
+            [string]$SourceType
+        )
+
+        if ([string]::IsNullOrEmpty($SDDLCondition)) {
+            return 0
+        }
+
+        $addedCount = 0
+        Write-Host "    $SourceType '$SourceName' has User Sign-On restriction" -ForegroundColor Gray
+        Write-Host "      SDDL: $SDDLCondition" -ForegroundColor DarkGray
+
+        # Extract groups from the SDDL condition
+        $groups = Get-GroupFromSDDL -SDDLCondition $SDDLCondition
+
+        foreach ($group in $groups) {
+            # Skip well-known SIDs that are not groups
+            if ($group.SID -match "^S-1-5-[0-9]+$" -or $group.SID -match "^S-1-1-0$") {
+                continue
+            }
+
+            # Check if we already have this group
+            $existingGroup = $Script:T0InfrastructureGroups | Where-Object { $_.SID -eq $group.SID }
+            if ($existingGroup) {
+                continue
+            }
+
+            try {
+                # Try to get as AD group - use GC port 3268 for cross-domain SID resolution
+                # (SID resolution works on GC, we just need Name and DN which are in GC)
+                $adGroup = Get-ADGroup -Identity $group.SID -Server "$($Script:GlobalCatalogServer):3268" `
+                    -Properties Name, DistinguishedName -ErrorAction Stop
+                if ($adGroup) {
+                    $null = $Script:T0InfrastructureGroups.Add([PSCustomObject]@{
+                        Name = $adGroup.Name
+                        DN = $adGroup.DistinguishedName
+                        SID = $group.SID
+                        SourcePolicy = "$SourceType`: $SourceName"
+                    })
+                    Write-Host "      [OK] Found infrastructure group: $($adGroup.Name)" -ForegroundColor Green
+                    Write-Host "          DN: $($adGroup.DistinguishedName)" -ForegroundColor Gray
+                    $addedCount++
+                }
+            }
+            catch {
+                Write-Host "      [!] Could not resolve SID $($group.SID) to a group - $_" -ForegroundColor Yellow
+            }
+        }
+        return $addedCount
+    }
+
+    # Method 1: Try to extract from Policy's msDS-UserAllowedToAuthenticateFrom
+    Write-Host "    Checking Authentication Policies for User Sign-On restrictions..." -ForegroundColor Gray
+    foreach ($policy in $Script:T0Policies) {
+        $null = Add-GroupsFromSDDL -SDDLCondition $policy.UserAllowedToAuthenticateFrom `
+            -SourceName $policy.Name -SourceType "Policy"
+    }
+
+    # Method 2: Try to extract from Silo's msDS-UserAllowedToAuthenticateFrom
+    Write-Host "    Checking Authentication Silos for User Sign-On restrictions..." -ForegroundColor Gray
+    foreach ($silo in $Script:T0Silos) {
+        $null = Add-GroupsFromSDDL -SDDLCondition $silo.UserAllowedToAuthenticateFrom `
+            -SourceName $silo.Name -SourceType "Silo"
+    }
+
+    # Method 3: If automatic discovery failed and user provided explicit group, use that as fallback
+    if ($Script:T0InfrastructureGroups.Count -eq 0 -and $T0InfrastructureGroupName.Count -gt 0) {
+        Write-Host "    Auto-discovery found no groups, using explicitly provided group(s)..." -ForegroundColor Yellow
 
         # Determine which domain to query
         $groupQueryServer = $null
@@ -630,10 +730,9 @@ function Invoke-Phase1Discovery {
                 $domainContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $T0InfrastructureGroupDomain)
                 $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($domainContext)
                 $groupQueryServer = $domain.FindDomainController().Name
-                Write-Host "    Querying domain: $T0InfrastructureGroupDomain (DC: $groupQueryServer)" -ForegroundColor Gray
             }
             catch {
-                Write-Host "    [!] Could not connect to domain $T0InfrastructureGroupDomain, using current domain" -ForegroundColor Yellow
+                Write-Host "    [!] Could not connect to domain $T0InfrastructureGroupDomain" -ForegroundColor Yellow
             }
         }
 
@@ -656,64 +755,22 @@ function Invoke-Phase1Discovery {
                     SourcePolicy = "Explicitly Specified"
                 })
                 Write-Host "      [OK] Found T0 Infrastructure Group: $($adGroup.Name)" -ForegroundColor Green
-                Write-Host "          DN: $($adGroup.DistinguishedName)" -ForegroundColor Gray
             }
             catch {
                 Write-Host "      [!] Could not find group: $groupName - $_" -ForegroundColor Red
             }
         }
     }
-    # Method 2: Try to extract from Policy SDDL (automatic discovery)
-    else {
-        Write-Host "    Attempting to extract groups from Policy SDDL..." -ForegroundColor Gray
 
-        foreach ($policy in $Script:T0Policies) {
-            $userAllowedFrom = $policy.UserAllowedToAuthenticateFrom
-
-            if (-not [string]::IsNullOrEmpty($userAllowedFrom)) {
-                Write-Host "    Policy '$($policy.Name)' has User Sign-On restriction" -ForegroundColor Gray
-                Write-Host "      SDDL: $userAllowedFrom" -ForegroundColor DarkGray
-
-                # Extract groups from the SDDL condition
-                $groups = Get-GroupFromSDDL -SDDLCondition $userAllowedFrom
-
-                foreach ($group in $groups) {
-                    # Check if this is a group (not a built-in SID)
-                    if ($group.SID -notmatch "^S-1-5-[0-9]+$" -and $group.SID -notmatch "^S-1-1-0$") {
-                        try {
-                            # Try to get as AD group
-                            $adGroup = Get-ADGroup -Identity $group.SID -Properties Members -ErrorAction SilentlyContinue
-                            if ($adGroup) {
-                                $null = $Script:T0InfrastructureGroups.Add([PSCustomObject]@{
-                                    Name = $adGroup.Name
-                                    DN = $adGroup.DistinguishedName
-                                    SID = $group.SID
-                                    SourcePolicy = $policy.Name
-                                })
-                                Write-Host "      Found infrastructure group: $($adGroup.Name)" -ForegroundColor Green
-                            }
-                        }
-                        catch {
-                            # Not a group or can't be resolved
-                        }
-                    }
-                }
-            }
-        }
-
-        # If SDDL parsing failed, provide guidance
-        if ($Script:T0InfrastructureGroups.Count -eq 0 -and $Script:T0Policies.Count -gt 0) {
-            Write-Host ""
-            Write-Host "    [!] WARNING: Could not extract T0 Infrastructure Groups from SDDL" -ForegroundColor Yellow
-            Write-Host "    [!] This is common when the restriction is configured via Silo or in a different format." -ForegroundColor Yellow
-            Write-Host ""
-            Write-Host "    [TIP] Re-run the script with explicit group name:" -ForegroundColor Cyan
-            Write-Host '         .\Invoke-T0AuthNSecurityAudit.ps1 -T0InfrastructureGroupName "Tier 0 Servers"' -ForegroundColor White
-            Write-Host ""
-            Write-Host "    [TIP] If the group is in a different domain:" -ForegroundColor Cyan
-            Write-Host '         .\Invoke-T0AuthNSecurityAudit.ps1 -T0InfrastructureGroupName "Tier 0 Servers" -T0InfrastructureGroupDomain "corp.pri"' -ForegroundColor White
-            Write-Host ""
-        }
+    # If all methods failed, provide guidance
+    if ($Script:T0InfrastructureGroups.Count -eq 0 -and ($Script:T0Policies.Count -gt 0 -or $Script:T0Silos.Count -gt 0)) {
+        Write-Host ""
+        Write-Host "    [!] WARNING: Could not automatically extract T0 Infrastructure Groups" -ForegroundColor Yellow
+        Write-Host "    [!] The User Sign-On restriction was not found or could not be parsed." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "    [TIP] Re-run the script with explicit group name:" -ForegroundColor Cyan
+        Write-Host '         .\Invoke-T0AuthNSecurityAudit.ps1 -T0InfrastructureGroupName "Tier 0 Servers"' -ForegroundColor White
+        Write-Host ""
     }
     Write-Host "    Found $($Script:T0InfrastructureGroups.Count) T0 Infrastructure Groups" -ForegroundColor $(if ($Script:T0InfrastructureGroups.Count -gt 0) { "Green" } else { "Yellow" })
 
