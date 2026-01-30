@@ -1083,7 +1083,7 @@ function Export-HTMLReport {
             $HTML += @"
                 <div style="margin: 15px 0; border: 1px solid #dee2e6; border-radius: 8px; overflow: hidden;">
                     <div style="$objectHeaderClass padding: 10px 15px; font-weight: bold; border-bottom: 1px solid #dee2e6;">
-                        $objectType: $objectName
+                        ${objectType}: ${objectName}
                         $(if ($objectCriticalCount -gt 0) { "<span class='severity-badge severity-critical' style='margin-left: 10px;'>$objectCriticalCount CRITICAL</span>" })
                     </div>
                     <table style="margin: 0;">
