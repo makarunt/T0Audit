@@ -83,14 +83,17 @@ $Script:WellKnownSIDs = @{
 
 # Domain-specific variables (populated at runtime)
 $Script:DomainInfo = $null
+$Script:ForestInfo = $null
 $Script:DomainSID = $null
 $Script:ConfigNC = $null
+$Script:GlobalCatalogServer = $null
 
 # T0 Discovery Results
 $Script:T0Policies = [System.Collections.ArrayList]::new()
 $Script:T0Silos = [System.Collections.ArrayList]::new()
 $Script:T0InfrastructureGroups = [System.Collections.ArrayList]::new()
 $Script:T0InfrastructureComputers = [System.Collections.ArrayList]::new()
+$Script:T0InfrastructureComputerDNs = @{}  # Hash for quick lookups
 $Script:PrivilegedUsers = [System.Collections.ArrayList]::new()
 $Script:DomainControllers = [System.Collections.ArrayList]::new()
 
@@ -134,7 +137,14 @@ function Initialize-AuditEnvironment {
     $Script:DomainSID = $Script:DomainInfo.DomainSID.Value
     $Script:ConfigNC = (Get-ADRootDSE).configurationNamingContext
 
+    # Get forest information for cross-domain queries
+    $Script:ForestInfo = Get-ADForest
+    $Script:GlobalCatalogServer = $Script:ForestInfo.GlobalCatalogs | Select-Object -First 1
+
     Write-Host "[+] Connected to domain: $($Script:DomainInfo.DNSRoot)" -ForegroundColor Green
+    Write-Host "[+] Forest Root: $($Script:ForestInfo.RootDomain)" -ForegroundColor Green
+    Write-Host "[+] Forest Domains: $($Script:ForestInfo.Domains -join ', ')" -ForegroundColor Green
+    Write-Host "[+] Global Catalog: $Script:GlobalCatalogServer" -ForegroundColor Green
     Write-Host "[+] Domain SID: $Script:DomainSID" -ForegroundColor Green
     Write-Host "[+] Output path: $OutputPath" -ForegroundColor Green
     Write-Host ""
@@ -286,87 +296,187 @@ function Invoke-Phase1Discovery {
     Write-Host "=" * 80 -ForegroundColor Yellow
     Write-Host ""
 
-    # Step 1.1: Identify all Domain Controllers
-    Write-Host "[Phase 1.1] Identifying Domain Controllers..." -ForegroundColor Cyan
+    # Step 1.1: Identify all Domain Controllers (FOREST-WIDE using Global Catalog)
+    Write-Host "[Phase 1.1] Identifying Domain Controllers (Forest-Wide)..." -ForegroundColor Cyan
     try {
-        $dcs = Get-ADComputer -Filter { PrimaryGroupID -eq 516 -or PrimaryGroupID -eq 521 } `
-            -Properties Name, DistinguishedName, DNSHostName, OperatingSystem, PrimaryGroupID, `
-                        "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo"
+        # Query ALL DCs in the forest via Global Catalog
+        # PrimaryGroupID 516 = Domain Controllers, 521 = Read-Only Domain Controllers
+        foreach ($domainDns in $Script:ForestInfo.Domains) {
+            Write-Host "    Scanning domain: $domainDns" -ForegroundColor Gray
+            try {
+                # Get a DC from this domain to query
+                $domainContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $domainDns)
+                $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($domainContext)
+                $domainDC = $domain.FindDomainController().Name
 
-        foreach ($dc in $dcs) {
-            $dcType = if ($dc.PrimaryGroupID -eq 516) { "RWDC" } else { "RODC" }
-            $null = $Script:DomainControllers.Add([PSCustomObject]@{
-                Name = $dc.Name
-                DN = $dc.DistinguishedName
-                DNSHostName = $dc.DNSHostName
-                OperatingSystem = $dc.OperatingSystem
-                Type = $dcType
-                AuthNPolicy = $dc."msDS-AssignedAuthNPolicy"
-                AuthNPolicySilo = $dc."msDS-AssignedAuthNPolicySilo"
-            })
+                $dcs = Get-ADComputer -Filter { PrimaryGroupID -eq 516 -or PrimaryGroupID -eq 521 } `
+                    -Server $domainDC `
+                    -Properties Name, DistinguishedName, DNSHostName, OperatingSystem, PrimaryGroupID, `
+                                "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo"
+
+                foreach ($dc in $dcs) {
+                    $dcType = if ($dc.PrimaryGroupID -eq 516) { "RWDC" } else { "RODC" }
+                    # Extract domain name from DN
+                    $dcDomain = ($dc.DistinguishedName -split ',DC=' | Select-Object -Skip 1) -join '.'
+                    $null = $Script:DomainControllers.Add([PSCustomObject]@{
+                        Name = $dc.Name
+                        DN = $dc.DistinguishedName
+                        DNSHostName = $dc.DNSHostName
+                        OperatingSystem = $dc.OperatingSystem
+                        Type = $dcType
+                        Domain = $dcDomain
+                        AuthNPolicy = $dc."msDS-AssignedAuthNPolicy"
+                        AuthNPolicySilo = $dc."msDS-AssignedAuthNPolicySilo"
+                    })
+                }
+                Write-Host "      Found $(@($dcs).Count) DCs in $domainDns" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "      [!] Error querying domain $domainDns : $_" -ForegroundColor Yellow
+            }
         }
-        Write-Host "    Found $($Script:DomainControllers.Count) Domain Controllers" -ForegroundColor Green
+        Write-Host "    Total Domain Controllers in Forest: $($Script:DomainControllers.Count)" -ForegroundColor Green
     }
     catch {
         Write-Host "    [!] Error collecting Domain Controllers: $_" -ForegroundColor Red
     }
 
-    # Step 1.2: Identify High-Privilege Users (The "Big Three" + additional)
-    Write-Host "[Phase 1.2] Identifying High-Privilege Users..." -ForegroundColor Cyan
+    # Step 1.2: Identify High-Privilege Users (FOREST-WIDE - The "Big Three" + additional)
+    Write-Host "[Phase 1.2] Identifying High-Privilege Users (Forest-Wide)..." -ForegroundColor Cyan
 
-    $privilegedGroups = @(
-        @{ Name = "Domain Admins"; Criticality = "Critical" }
+    # Forest-wide groups (in forest root domain only)
+    $forestRootGroups = @(
         @{ Name = "Enterprise Admins"; Criticality = "Critical" }
         @{ Name = "Schema Admins"; Criticality = "Critical" }
     )
 
-    # Add user-specified groups
+    # Per-domain groups
+    $perDomainGroups = @(
+        @{ Name = "Domain Admins"; Criticality = "Critical" }
+    )
+
+    # Add user-specified groups (assumed per-domain)
     foreach ($additionalGroup in $AdditionalPrivilegedGroups) {
-        $privilegedGroups += @{ Name = $additionalGroup; Criticality = "High" }
+        $perDomainGroups += @{ Name = $additionalGroup; Criticality = "High" }
     }
 
     $processedUsers = @{}
 
-    foreach ($group in $privilegedGroups) {
-        Write-Host "    Checking: $($group.Name)" -ForegroundColor Gray
-        try {
-            $members = Get-ADGroupMember -Identity $group.Name -Recursive -ErrorAction Stop |
-                       Where-Object { $_.objectClass -eq "user" }
+    # Helper function to add user to privileged list
+    function Add-PrivilegedUser {
+        param($member, $groupName, $criticality, $serverHint)
 
-            foreach ($member in $members) {
-                if ($processedUsers.ContainsKey($member.distinguishedName)) {
-                    # Update group membership
-                    $idx = $Script:PrivilegedUsers.DN.IndexOf($member.distinguishedName)
-                    if ($idx -ge 0) {
-                        $Script:PrivilegedUsers[$idx].MemberOf += ", $($group.Name)"
+        if ($processedUsers.ContainsKey($member.distinguishedName)) {
+            # Update group membership for existing user
+            for ($i = 0; $i -lt $Script:PrivilegedUsers.Count; $i++) {
+                if ($Script:PrivilegedUsers[$i].DN -eq $member.distinguishedName) {
+                    if ($Script:PrivilegedUsers[$i].MemberOf -notmatch [regex]::Escape($groupName)) {
+                        $Script:PrivilegedUsers[$i].MemberOf += ", $groupName"
                     }
-                    continue
+                    break
                 }
+            }
+            return
+        }
 
-                $processedUsers[$member.distinguishedName] = $true
+        $processedUsers[$member.distinguishedName] = $true
 
-                # Get full user details with AuthN attributes
-                $userDetails = Get-ADUser -Identity $member.distinguishedName `
-                    -Properties Name, SamAccountName, DistinguishedName, Enabled, `
-                                "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo"
+        try {
+            # Get user's domain DC for querying
+            $userDomainDN = ($member.distinguishedName -split ',DC=' | Select-Object -Skip 1) -join ',DC='
+            $userDomainDN = "DC=" + $userDomainDN
+            $userDomain = ($member.distinguishedName -split ',DC=' | Select-Object -Skip 1) -join '.'
 
-                $null = $Script:PrivilegedUsers.Add([PSCustomObject]@{
-                    Name = $userDetails.Name
-                    SamAccountName = $userDetails.SamAccountName
-                    DN = $userDetails.DistinguishedName
-                    Enabled = $userDetails.Enabled
-                    MemberOf = $group.Name
-                    Criticality = $group.Criticality
-                    AuthNPolicy = $userDetails."msDS-AssignedAuthNPolicy"
-                    AuthNPolicySilo = $userDetails."msDS-AssignedAuthNPolicySilo"
-                })
+            # Try to query the user from their home domain
+            $queryServer = $serverHint
+            if ([string]::IsNullOrEmpty($queryServer)) {
+                try {
+                    $domainContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $userDomain)
+                    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($domainContext)
+                    $queryServer = $domain.FindDomainController().Name
+                }
+                catch {
+                    $queryServer = $Script:GlobalCatalogServer
+                }
+            }
+
+            $userDetails = Get-ADUser -Identity $member.distinguishedName -Server $queryServer `
+                -Properties Name, SamAccountName, DistinguishedName, Enabled, `
+                            "msDS-AssignedAuthNPolicy", "msDS-AssignedAuthNPolicySilo"
+
+            $null = $Script:PrivilegedUsers.Add([PSCustomObject]@{
+                Name = $userDetails.Name
+                SamAccountName = $userDetails.SamAccountName
+                DN = $userDetails.DistinguishedName
+                Domain = $userDomain
+                Enabled = $userDetails.Enabled
+                MemberOf = $groupName
+                Criticality = $criticality
+                AuthNPolicy = $userDetails."msDS-AssignedAuthNPolicy"
+                AuthNPolicySilo = $userDetails."msDS-AssignedAuthNPolicySilo"
+            })
+        }
+        catch {
+            Write-Host "        [!] Could not get details for: $($member.Name) - $_" -ForegroundColor Yellow
+        }
+    }
+
+    # Query forest-wide groups from forest root domain
+    Write-Host "    Querying forest root domain: $($Script:ForestInfo.RootDomain)" -ForegroundColor Gray
+    try {
+        $forestRootContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $Script:ForestInfo.RootDomain)
+        $forestRootDomain = [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($forestRootContext)
+        $forestRootDC = $forestRootDomain.FindDomainController().Name
+
+        foreach ($group in $forestRootGroups) {
+            Write-Host "      Checking: $($group.Name)" -ForegroundColor Gray
+            try {
+                $members = Get-ADGroupMember -Identity $group.Name -Server $forestRootDC -Recursive -ErrorAction Stop |
+                           Where-Object { $_.objectClass -eq "user" }
+
+                foreach ($member in $members) {
+                    Add-PrivilegedUser -member $member -groupName $group.Name -criticality $group.Criticality -serverHint $forestRootDC
+                }
+                Write-Host "        Found $(@($members).Count) members" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "        [!] Group not found or not accessible: $($group.Name)" -ForegroundColor Yellow
+            }
+        }
+    }
+    catch {
+        Write-Host "      [!] Error connecting to forest root: $_" -ForegroundColor Yellow
+    }
+
+    # Query per-domain groups from each domain
+    foreach ($domainDns in $Script:ForestInfo.Domains) {
+        Write-Host "    Querying domain: $domainDns" -ForegroundColor Gray
+        try {
+            $domainContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $domainDns)
+            $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($domainContext)
+            $domainDC = $domain.FindDomainController().Name
+
+            foreach ($group in $perDomainGroups) {
+                Write-Host "      Checking: $($group.Name)" -ForegroundColor Gray
+                try {
+                    $members = Get-ADGroupMember -Identity $group.Name -Server $domainDC -Recursive -ErrorAction Stop |
+                               Where-Object { $_.objectClass -eq "user" }
+
+                    foreach ($member in $members) {
+                        Add-PrivilegedUser -member $member -groupName "$($group.Name) ($domainDns)" -criticality $group.Criticality -serverHint $domainDC
+                    }
+                    Write-Host "        Found $(@($members).Count) members" -ForegroundColor Green
+                }
+                catch {
+                    Write-Host "        [!] Group not found or not accessible: $($group.Name)" -ForegroundColor Yellow
+                }
             }
         }
         catch {
-            Write-Host "      [!] Group not found or not accessible: $($group.Name)" -ForegroundColor Yellow
+            Write-Host "      [!] Error connecting to domain $domainDns : $_" -ForegroundColor Yellow
         }
     }
-    Write-Host "    Found $($Script:PrivilegedUsers.Count) unique privileged users" -ForegroundColor Green
+    Write-Host "    Total unique privileged users in forest: $($Script:PrivilegedUsers.Count)" -ForegroundColor Green
 
     # Step 1.3: Discover T0 Policies and Silos from privileged user assignments
     Write-Host "[Phase 1.3] Discovering T0 Security Boundaries (Policies & Silos)..." -ForegroundColor Cyan
@@ -517,23 +627,94 @@ function Invoke-Phase1Discovery {
     }
     Write-Host "    Found $($Script:T0InfrastructureGroups.Count) T0 Infrastructure Groups" -ForegroundColor Green
 
-    # Step 1.5: Get all computers in T0 Infrastructure Groups
-    Write-Host "[Phase 1.5] Mapping T0 Infrastructure Computers..." -ForegroundColor Cyan
+    # Step 1.5: Get all computers in T0 Infrastructure Groups (with nested group resolution)
+    Write-Host "[Phase 1.5] Mapping T0 Infrastructure Computers (resolving nested groups)..." -ForegroundColor Cyan
 
     $processedComputers = @{}
 
-    foreach ($group in $Script:T0InfrastructureGroups) {
+    # Helper function to recursively resolve group members across domains
+    function Get-NestedGroupMembers {
+        param(
+            [string]$GroupDN,
+            [string]$SourceGroupName,
+            [hashtable]$ProcessedGroups = @{}
+        )
+
+        if ($ProcessedGroups.ContainsKey($GroupDN)) {
+            return @()  # Prevent infinite loops
+        }
+        $ProcessedGroups[$GroupDN] = $true
+
+        $results = @()
+
         try {
-            $members = Get-ADGroupMember -Identity $group.DN -Recursive -ErrorAction SilentlyContinue |
-                       Where-Object { $_.objectClass -eq "computer" }
+            # Determine which domain this group is in
+            $groupDomain = ($GroupDN -split ',DC=' | Select-Object -Skip 1) -join '.'
+
+            # Find a DC for that domain
+            $queryServer = $null
+            try {
+                $domainContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $groupDomain)
+                $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($domainContext)
+                $queryServer = $domain.FindDomainController().Name
+            }
+            catch {
+                # Fallback to global catalog
+                $queryServer = $Script:GlobalCatalogServer + ":3268"
+            }
+
+            Write-Host "      Resolving group: $GroupDN (via $queryServer)" -ForegroundColor Gray
+
+            # Get direct members of the group
+            $members = Get-ADGroupMember -Identity $GroupDN -Server $queryServer -ErrorAction Stop
 
             foreach ($member in $members) {
-                if ($processedComputers.ContainsKey($member.distinguishedName)) {
-                    continue
+                if ($member.objectClass -eq "computer") {
+                    $results += [PSCustomObject]@{
+                        DN = $member.distinguishedName
+                        Name = $member.Name
+                        SourceGroup = $SourceGroupName
+                    }
                 }
-                $processedComputers[$member.distinguishedName] = $true
+                elseif ($member.objectClass -eq "group") {
+                    # Recursively resolve nested group
+                    $nestedResults = Get-NestedGroupMembers -GroupDN $member.distinguishedName -SourceGroupName $SourceGroupName -ProcessedGroups $ProcessedGroups
+                    $results += $nestedResults
+                }
+            }
+        }
+        catch {
+            Write-Host "        [!] Error resolving group $GroupDN : $_" -ForegroundColor Yellow
+        }
 
-                $computer = Get-ADComputer -Identity $member.distinguishedName `
+        return $results
+    }
+
+    foreach ($group in $Script:T0InfrastructureGroups) {
+        Write-Host "    Processing T0 Infrastructure Group: $($group.Name)" -ForegroundColor Gray
+
+        $nestedMembers = Get-NestedGroupMembers -GroupDN $group.DN -SourceGroupName $group.Name
+
+        foreach ($member in $nestedMembers) {
+            if ($processedComputers.ContainsKey($member.DN)) {
+                continue
+            }
+            $processedComputers[$member.DN] = $true
+
+            try {
+                # Get computer from its home domain
+                $compDomain = ($member.DN -split ',DC=' | Select-Object -Skip 1) -join '.'
+                $queryServer = $null
+                try {
+                    $domainContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $compDomain)
+                    $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($domainContext)
+                    $queryServer = $domain.FindDomainController().Name
+                }
+                catch {
+                    $queryServer = $Script:GlobalCatalogServer
+                }
+
+                $computer = Get-ADComputer -Identity $member.DN -Server $queryServer `
                     -Properties Name, DistinguishedName, DNSHostName, OperatingSystem, PrimaryGroupID
 
                 $isDC = ($computer.PrimaryGroupID -eq 516 -or $computer.PrimaryGroupID -eq 521)
@@ -543,25 +724,30 @@ function Invoke-Phase1Discovery {
                     DN = $computer.DistinguishedName
                     DNSHostName = $computer.DNSHostName
                     OperatingSystem = $computer.OperatingSystem
+                    Domain = $compDomain
                     IsDomainController = $isDC
-                    SourceGroup = $group.Name
+                    SourceGroup = $member.SourceGroup
                 })
+
+                # Also add to hash for quick lookups
+                $Script:T0InfrastructureComputerDNs[$computer.DistinguishedName] = $true
+            }
+            catch {
+                Write-Host "        [!] Could not get details for: $($member.Name)" -ForegroundColor Yellow
             }
         }
-        catch {
-            Write-Host "      [!] Error reading group members: $($group.Name)" -ForegroundColor Yellow
-        }
     }
-    Write-Host "    Found $($Script:T0InfrastructureComputers.Count) computers in T0 Infrastructure Groups" -ForegroundColor Green
+    Write-Host "    Found $($Script:T0InfrastructureComputers.Count) computers in T0 Infrastructure Groups (including nested)" -ForegroundColor Green
 
     Write-Host ""
-    Write-Host "[Phase 1 Complete] Discovery Summary:" -ForegroundColor Green
-    Write-Host "    Domain Controllers:      $($Script:DomainControllers.Count)" -ForegroundColor White
-    Write-Host "    Privileged Users:        $($Script:PrivilegedUsers.Count)" -ForegroundColor White
-    Write-Host "    T0 Policies:             $($Script:T0Policies.Count)" -ForegroundColor White
-    Write-Host "    T0 Silos:                $($Script:T0Silos.Count)" -ForegroundColor White
-    Write-Host "    T0 Infrastructure Groups: $($Script:T0InfrastructureGroups.Count)" -ForegroundColor White
-    Write-Host "    T0 Infrastructure Computers: $($Script:T0InfrastructureComputers.Count)" -ForegroundColor White
+    Write-Host "[Phase 1 Complete] Discovery Summary (Forest-Wide):" -ForegroundColor Green
+    Write-Host "    Forest Domains:              $($Script:ForestInfo.Domains.Count) ($($Script:ForestInfo.Domains -join ', '))" -ForegroundColor White
+    Write-Host "    Domain Controllers (total):  $($Script:DomainControllers.Count)" -ForegroundColor White
+    Write-Host "    Privileged Users (total):    $($Script:PrivilegedUsers.Count)" -ForegroundColor White
+    Write-Host "    T0 Policies:                 $($Script:T0Policies.Count)" -ForegroundColor White
+    Write-Host "    T0 Silos:                    $($Script:T0Silos.Count)" -ForegroundColor White
+    Write-Host "    T0 Infrastructure Groups:    $($Script:T0InfrastructureGroups.Count)" -ForegroundColor White
+    Write-Host "    T0 Infrastructure Computers: $($Script:T0InfrastructureComputers.Count) (nested groups resolved)" -ForegroundColor White
     Write-Host ""
 }
 
@@ -737,6 +923,7 @@ function Invoke-Phase3GapAnalysis {
             ObjectName = $user.Name
             SamAccountName = $user.SamAccountName
             ObjectDN = $user.DN
+            Domain = $user.Domain
             MemberOf = $user.MemberOf
             Enabled = $user.Enabled
             ProtectionStatus = $status
@@ -748,14 +935,12 @@ function Invoke-Phase3GapAnalysis {
     $unprotectedUsers = ($Results | Where-Object { $_.GapType -eq "Privileged Account" -and $_.ProtectionStatus -eq "UNPROTECTED" }).Count
     Write-Host "    Privileged users without policy: $unprotectedUsers" -ForegroundColor $(if ($unprotectedUsers -gt 0) { "Red" } else { "Green" })
 
-    # Audit B: Domain Controller Infrastructure Gap
-    Write-Host "[Phase 3.2] Checking Domain Controller Infrastructure Protection..." -ForegroundColor Cyan
+    # Audit B: Domain Controller Infrastructure Gap (FOREST-WIDE)
+    Write-Host "[Phase 3.2] Checking Domain Controller Infrastructure Protection (Forest-Wide)..." -ForegroundColor Cyan
 
-    # Build list of computers in T0 infrastructure groups
-    $t0ComputerDNs = $Script:T0InfrastructureComputers | ForEach-Object { $_.DN }
-
+    # Use hash table for fast lookups
     foreach ($dc in $Script:DomainControllers) {
-        $inT0Group = $t0ComputerDNs -contains $dc.DN
+        $inT0Group = $Script:T0InfrastructureComputerDNs.ContainsKey($dc.DN)
         $hasPolicy = -not [string]::IsNullOrEmpty($dc.AuthNPolicy)
         $hasSilo = -not [string]::IsNullOrEmpty($dc.AuthNPolicySilo)
 
@@ -775,7 +960,15 @@ function Invoke-Phase3GapAnalysis {
         $status = if ($issues.Count -eq 0) { "Compliant" } else { "NON-COMPLIANT" }
 
         $protectionDetails = @()
-        if ($inT0Group) { $protectionDetails += "In T0 Group: Yes" }
+        if ($inT0Group) {
+            # Find which T0 group this DC is in
+            $sourceGroup = ($Script:T0InfrastructureComputers | Where-Object { $_.DN -eq $dc.DN }).SourceGroup
+            if ($sourceGroup) {
+                $protectionDetails += "In T0 Group: $sourceGroup"
+            } else {
+                $protectionDetails += "In T0 Group: Yes"
+            }
+        }
         if ($hasPolicy) {
             $policyName = ($dc.AuthNPolicy -split ",")[0] -replace "CN=", ""
             $protectionDetails += "Policy: $policyName"
@@ -793,6 +986,7 @@ function Invoke-Phase3GapAnalysis {
             ObjectName = $dc.Name
             SamAccountName = $dc.Name + "$"
             ObjectDN = $dc.DN
+            Domain = $dc.Domain
             MemberOf = "Domain Controllers ($($dc.Type))"
             Enabled = $true
             ProtectionStatus = $status
@@ -802,7 +996,8 @@ function Invoke-Phase3GapAnalysis {
     }
 
     $nonCompliantDCs = ($Results | Where-Object { $_.GapType -eq "Domain Controller" -and $_.ProtectionStatus -eq "NON-COMPLIANT" }).Count
-    Write-Host "    Non-compliant Domain Controllers: $nonCompliantDCs" -ForegroundColor $(if ($nonCompliantDCs -gt 0) { "Red" } else { "Green" })
+    $totalDCs = ($Results | Where-Object { $_.GapType -eq "Domain Controller" }).Count
+    Write-Host "    Total DCs in forest: $totalDCs, Non-compliant: $nonCompliantDCs" -ForegroundColor $(if ($nonCompliantDCs -gt 0) { "Red" } else { "Green" })
 
     # Audit C: Policy-to-Silo Mapping Check
     Write-Host "[Phase 3.3] Checking Policy-to-Silo Enforcement..." -ForegroundColor Cyan
@@ -858,18 +1053,22 @@ function Invoke-Phase3GapAnalysis {
 function Invoke-Phase4AccessMap {
     <#
     .SYNOPSIS
-        Phase 4: Map where T0 admins can authenticate
+        Phase 4: Map where T0 admins can authenticate (User Sign-On Reachability)
     #>
 
     Write-Host "=" * 80 -ForegroundColor Yellow
-    Write-Host "  PHASE 4: Access Map (Reachability Report)" -ForegroundColor Yellow
+    Write-Host "  PHASE 4: Access Map (T0 User Sign-On Reachability)" -ForegroundColor Yellow
     Write-Host "=" * 80 -ForegroundColor Yellow
     Write-Host ""
 
     $Results = [System.Collections.ArrayList]::new()
 
-    Write-Host "[Phase 4.1] Mapping T0 Admin Effective Perimeter..." -ForegroundColor Cyan
+    Write-Host "[Phase 4.1] Mapping T0 Admin Effective Perimeter (Forest-Wide)..." -ForegroundColor Cyan
 
+    # Track which DCs we've already added
+    $addedDCs = @{}
+
+    # First, add all computers that ARE in T0 Infrastructure Groups
     foreach ($computer in $Script:T0InfrastructureComputers) {
         $status = if ($computer.IsDomainController) { "Expected" } else { "WARNING - T0 Pollution" }
         $severity = if ($computer.IsDomainController) { "Info" } else { "Warning" }
@@ -877,6 +1076,7 @@ function Invoke-Phase4AccessMap {
         $null = $Results.Add([PSCustomObject]@{
             ComputerName = $computer.Name
             DNSHostName = $computer.DNSHostName
+            Domain = $computer.Domain
             OperatingSystem = $computer.OperatingSystem
             IsDomainController = $computer.IsDomainController
             SourceGroup = $computer.SourceGroup
@@ -884,15 +1084,19 @@ function Invoke-Phase4AccessMap {
             Severity = $severity
             DN = $computer.DN
         })
+
+        if ($computer.IsDomainController) {
+            $addedDCs[$computer.DN] = $true
+        }
     }
 
-    # Check for DCs not in any T0 group
+    # Check for DCs not in any T0 group (FOREST-WIDE)
     foreach ($dc in $Script:DomainControllers) {
-        $inResults = $Results | Where-Object { $_.DN -eq $dc.DN }
-        if (-not $inResults) {
+        if (-not $addedDCs.ContainsKey($dc.DN)) {
             $null = $Results.Add([PSCustomObject]@{
                 ComputerName = $dc.Name
                 DNSHostName = $dc.DNSHostName
+                Domain = $dc.Domain
                 OperatingSystem = $dc.OperatingSystem
                 IsDomainController = $true
                 SourceGroup = "NONE - Not in any T0 Group!"
@@ -904,15 +1108,16 @@ function Invoke-Phase4AccessMap {
     }
 
     # Summary
-    $dcCount = ($Results | Where-Object { $_.IsDomainController }).Count
+    $dcInPerimeter = ($Results | Where-Object { $_.IsDomainController -and $_.Severity -eq "Info" }).Count
+    $dcNotInPerimeter = ($Results | Where-Object { $_.IsDomainController -and $_.Severity -eq "Critical" }).Count
     $nonDCCount = ($Results | Where-Object { -not $_.IsDomainController }).Count
     $criticalCount = ($Results | Where-Object { $_.Severity -eq "Critical" }).Count
 
     Write-Host ""
-    Write-Host "[Phase 4 Complete] Access Map Summary:" -ForegroundColor Green
-    Write-Host "    Domain Controllers in Perimeter: $dcCount" -ForegroundColor White
-    Write-Host "    Non-DC Servers (T0 Pollution):   $nonDCCount" -ForegroundColor $(if ($nonDCCount -gt 0) { "Yellow" } else { "Green" })
-    Write-Host "    Critical (DCs not reachable):    $criticalCount" -ForegroundColor $(if ($criticalCount -gt 0) { "Red" } else { "Green" })
+    Write-Host "[Phase 4 Complete] Access Map Summary (Forest-Wide):" -ForegroundColor Green
+    Write-Host "    DCs in T0 Perimeter (reachable):     $dcInPerimeter" -ForegroundColor Green
+    Write-Host "    DCs NOT in T0 Perimeter (critical):  $dcNotInPerimeter" -ForegroundColor $(if ($dcNotInPerimeter -gt 0) { "Red" } else { "Green" })
+    Write-Host "    Non-DC Servers (T0 Pollution):       $nonDCCount" -ForegroundColor $(if ($nonDCCount -gt 0) { "Yellow" } else { "Green" })
     Write-Host ""
 
     return $Results
@@ -1048,14 +1253,15 @@ function Export-HTMLReport {
         </div>
 
         <div class="discovery-summary">
-            <h3>Phase 1 Discovery Results</h3>
+            <h3>Phase 1 Discovery Results (Forest-Wide)</h3>
             <ul>
-                <li>$($Script:DomainControllers.Count) Domain Controllers identified</li>
-                <li>$($Script:PrivilegedUsers.Count) Privileged Users (DA/EA/SA members)</li>
+                <li>$($Script:ForestInfo.Domains.Count) Domains in Forest ($($Script:ForestInfo.Domains -join ', '))</li>
+                <li>$($Script:DomainControllers.Count) Domain Controllers identified (all domains)</li>
+                <li>$($Script:PrivilegedUsers.Count) Privileged Users (DA/EA/SA members, forest-wide)</li>
                 <li>$($Script:T0Policies.Count) T0 Authentication Policies discovered</li>
                 <li>$($Script:T0Silos.Count) T0 Authentication Silos discovered</li>
                 <li>$($Script:T0InfrastructureGroups.Count) T0 Infrastructure Groups mapped</li>
-                <li>$($Script:T0InfrastructureComputers.Count) Computers in T0 perimeter</li>
+                <li>$($Script:T0InfrastructureComputers.Count) Computers in T0 perimeter (nested groups resolved)</li>
             </ul>
         </div>
 
@@ -1172,6 +1378,7 @@ function Export-HTMLReport {
                             <th>Severity</th>
                             <th>Gap Type</th>
                             <th>Object</th>
+                            <th>Domain</th>
                             <th>Member Of</th>
                             <th>Status</th>
                             <th>Details</th>
@@ -1188,6 +1395,7 @@ function Export-HTMLReport {
                             <td><span class="severity-badge $severityClass">$($gap.Severity.ToUpper())</span></td>
                             <td>$($gap.GapType)</td>
                             <td><strong>$($gap.ObjectName)</strong></td>
+                            <td>$($gap.Domain)</td>
                             <td>$($gap.MemberOf)</td>
                             <td>$($gap.ProtectionStatus)</td>
                             <td>$($gap.ProtectionDetails)</td>
@@ -1225,6 +1433,7 @@ function Export-HTMLReport {
                         <tr>
                             <th>Status</th>
                             <th>Computer</th>
+                            <th>Domain</th>
                             <th>DNS Name</th>
                             <th>Operating System</th>
                             <th>Is DC?</th>
@@ -1242,6 +1451,7 @@ function Export-HTMLReport {
                         <tr class="$rowClass">
                             <td><span class="severity-badge $severityClass">$statusText</span></td>
                             <td><strong>$($comp.ComputerName)</strong></td>
+                            <td>$($comp.Domain)</td>
                             <td>$($comp.DNSHostName)</td>
                             <td>$($comp.OperatingSystem)</td>
                             <td>$(if ($comp.IsDomainController) { 'Yes' } else { 'No' })</td>
