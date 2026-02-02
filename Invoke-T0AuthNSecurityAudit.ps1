@@ -528,19 +528,17 @@ function Invoke-Phase1Discovery {
         }
     }
 
-    # Get full details for discovered policies
-    # Note: Auth Policies are in Configuration partition - use regular LDAP (not GC) to get all attributes
-    # GC (port 3268) doesn't contain all attributes like msDS-UserAllowedToAuthenticateFrom
+    # Get full details for discovered policies using Get-ADAuthenticationPolicy cmdlet
+    # This cmdlet properly returns UserAllowedToAuthenticateFrom (unlike Get-ADObject)
     foreach ($policyDN in $discoveredPolicies.Keys) {
         try {
-            # Query directly by DN - any DC can read Configuration partition
-            $policy = Get-ADObject -Identity $policyDN -Server $Script:GlobalCatalogServer `
-                -Properties Name, DistinguishedName, Description, `
-                            "msDS-UserAllowedToAuthenticateFrom", "msDS-UserAllowedToAuthenticateTo", `
-                            "msDS-UserTGTLifetime", "msDS-ComputerAllowedToAuthenticateTo", `
-                            "msDS-ServiceAllowedToAuthenticateFrom", "msDS-ServiceAllowedToAuthenticateTo"
+            # Extract policy name from DN (CN=PolicyName,CN=AuthN Policies,...)
+            $policyName = ($policyDN -split ',')[0] -replace 'CN=', ''
 
-            $userAllowedFrom = $policy."msDS-UserAllowedToAuthenticateFrom"
+            # Use Get-ADAuthenticationPolicy which properly returns all attributes
+            $policy = Get-ADAuthenticationPolicy -Identity $policyName -Server $Script:GlobalCatalogServer
+
+            $userAllowedFrom = $policy.UserAllowedToAuthenticateFrom
             Write-Host "      Policy: $($policy.Name)" -ForegroundColor Gray
             if (-not [string]::IsNullOrEmpty($userAllowedFrom)) {
                 Write-Host "        UserAllowedToAuthenticateFrom: $userAllowedFrom" -ForegroundColor DarkGray
@@ -553,8 +551,8 @@ function Invoke-Phase1Discovery {
                 DN = $policy.DistinguishedName
                 Description = $policy.Description
                 UserAllowedToAuthenticateFrom = $userAllowedFrom
-                UserAllowedToAuthenticateTo = $policy."msDS-UserAllowedToAuthenticateTo"
-                UserTGTLifetime = $policy."msDS-UserTGTLifetime"
+                UserAllowedToAuthenticateTo = $policy.UserAllowedToAuthenticateTo
+                UserTGTLifetime = $policy.UserTGTLifetime
                 AssignedUsers = $discoveredPolicies[$policyDN]
                 DiscoverySource = "Privileged User Assignment"
             })
@@ -565,57 +563,47 @@ function Invoke-Phase1Discovery {
     }
     Write-Host "    Found $($Script:T0Policies.Count) T0 Authentication Policies" -ForegroundColor Green
 
-    # Get full details for discovered silos
+    # Get full details for discovered silos using Get-ADAuthenticationPolicySilo cmdlet
     foreach ($siloDN in $discoveredSilos.Keys) {
         try {
-            # Query Silo using regular LDAP (not GC) to get all attributes
-            # GC port 3268 doesn't contain all attributes like msDS-UserAllowedToAuthenticateFrom
-            $silo = Get-ADObject -Identity $siloDN -Server $Script:GlobalCatalogServer `
-                -Properties Name, DistinguishedName, Description, `
-                            "msDS-AuthNPolicySiloMembers", "msDS-AuthNPolicySiloEnforced", `
-                            "msDS-ComputerAuthNPolicy", "msDS-ServiceAuthNPolicy", "msDS-UserAuthNPolicy", `
-                            "msDS-UserAllowedToAuthenticateFrom"
+            # Extract silo name from DN (CN=SiloName,CN=AuthN Policy Silos,...)
+            $siloName = ($siloDN -split ',')[0] -replace 'CN=', ''
+
+            # Use Get-ADAuthenticationPolicySilo which properly returns all attributes
+            $silo = Get-ADAuthenticationPolicySilo -Identity $siloName -Server $Script:GlobalCatalogServer
 
             Write-Host "      Silo: $($silo.Name)" -ForegroundColor Gray
 
-            # Check if Silo has UserAllowedToAuthenticateFrom directly
-            $siloUserAllowedFrom = $silo."msDS-UserAllowedToAuthenticateFrom"
-            if (-not [string]::IsNullOrEmpty($siloUserAllowedFrom)) {
-                Write-Host "        Silo UserAllowedToAuthenticateFrom: $siloUserAllowedFrom" -ForegroundColor DarkGray
-            }
-
+            # Silos don't have UserAllowedToAuthenticateFrom directly - it's on the linked policies
             $null = $Script:T0Silos.Add([PSCustomObject]@{
                 Name = $silo.Name
                 DN = $silo.DistinguishedName
                 Description = $silo.Description
-                IsEnforced = $silo."msDS-AuthNPolicySiloEnforced"
-                Members = $silo."msDS-AuthNPolicySiloMembers"
-                ComputerPolicy = $silo."msDS-ComputerAuthNPolicy"
-                ServicePolicy = $silo."msDS-ServiceAuthNPolicy"
-                UserPolicy = $silo."msDS-UserAuthNPolicy"
-                UserAllowedToAuthenticateFrom = $siloUserAllowedFrom
+                IsEnforced = $silo.Enforce
+                Members = $silo.Members
+                ComputerPolicy = $silo.ComputerAuthenticationPolicy
+                ServicePolicy = $silo.ServiceAuthenticationPolicy
+                UserPolicy = $silo.UserAuthenticationPolicy
+                UserAllowedToAuthenticateFrom = $null  # Stored on the linked policy
                 AssignedUsers = $discoveredSilos[$siloDN]
                 DiscoverySource = "Privileged User Assignment"
             })
 
             # IMPORTANT: Also discover policies linked to this Silo
-            # These are T0 policies even if not directly assigned to users
-            $siloPolicies = @($silo."msDS-UserAuthNPolicy", $silo."msDS-ComputerAuthNPolicy", $silo."msDS-ServiceAuthNPolicy") |
-                            Where-Object { -not [string]::IsNullOrEmpty($_) }
+            # The UserAllowedToAuthenticateFrom is typically on the UserAuthenticationPolicy
+            $linkedPolicyNames = @($silo.UserAuthenticationPolicy, $silo.ComputerAuthenticationPolicy, $silo.ServiceAuthenticationPolicy) |
+                                 Where-Object { -not [string]::IsNullOrEmpty($_) } |
+                                 Select-Object -Unique
 
-            foreach ($policyDN in $siloPolicies) {
+            foreach ($linkedPolicyName in $linkedPolicyNames) {
                 # Check if we already have this policy
-                $existingPolicy = $Script:T0Policies | Where-Object { $_.DN -eq $policyDN }
+                $existingPolicy = $Script:T0Policies | Where-Object { $_.Name -eq $linkedPolicyName }
                 if (-not $existingPolicy) {
                     try {
-                        # Query policy using regular LDAP to get all attributes
-                        $policy = Get-ADObject -Identity $policyDN -Server $Script:GlobalCatalogServer `
-                            -Properties Name, DistinguishedName, Description, `
-                                        "msDS-UserAllowedToAuthenticateFrom", "msDS-UserAllowedToAuthenticateTo", `
-                                        "msDS-UserTGTLifetime", "msDS-ComputerAllowedToAuthenticateTo", `
-                                        "msDS-ServiceAllowedToAuthenticateFrom", "msDS-ServiceAllowedToAuthenticateTo"
+                        # Use Get-ADAuthenticationPolicy for linked policies
+                        $policy = Get-ADAuthenticationPolicy -Identity $linkedPolicyName -Server $Script:GlobalCatalogServer
 
-                        $userAllowedFrom = $policy."msDS-UserAllowedToAuthenticateFrom"
+                        $userAllowedFrom = $policy.UserAllowedToAuthenticateFrom
                         Write-Host "        Linked Policy: $($policy.Name)" -ForegroundColor Gray
                         if (-not [string]::IsNullOrEmpty($userAllowedFrom)) {
                             Write-Host "          UserAllowedToAuthenticateFrom: $userAllowedFrom" -ForegroundColor DarkGray
@@ -628,14 +616,14 @@ function Invoke-Phase1Discovery {
                             DN = $policy.DistinguishedName
                             Description = $policy.Description
                             UserAllowedToAuthenticateFrom = $userAllowedFrom
-                            UserAllowedToAuthenticateTo = $policy."msDS-UserAllowedToAuthenticateTo"
-                            UserTGTLifetime = $policy."msDS-UserTGTLifetime"
+                            UserAllowedToAuthenticateTo = $policy.UserAllowedToAuthenticateTo
+                            UserTGTLifetime = $policy.UserTGTLifetime
                             AssignedUsers = @()
                             DiscoverySource = "Linked to Silo: $($silo.Name)"
                         })
                     }
                     catch {
-                        Write-Host "      [!] Could not read policy linked to silo: $policyDN - $_" -ForegroundColor Yellow
+                        Write-Host "      [!] Could not read policy linked to silo: $linkedPolicyName - $_" -ForegroundColor Yellow
                     }
                 }
             }
